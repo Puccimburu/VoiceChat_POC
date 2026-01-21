@@ -1,0 +1,9 @@
+flask==3.1.0
+flask-cors==5.0.0
+pyaudio==0.2.14
+faster-whisper>=1.0.0
+google-generativeai==0.8.5
+python-dotenv==1.0.0
+webrtcvad==2.0.10
+imageio-ffmpeg>=0.6.0
+piper-tts>=1.2.0
