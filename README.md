@@ -37,5 +37,5 @@ npm start
 
 - **STT**: Local speech-to-text using OpenAI Whisper
 - **LLM**: Gemini 1.5 Flash via Google AI Studio
-- **TTS**: Local text-to-speech using pyttsx3
+- **TTS**: Local text-to-speech using piper
 - **Frontend**: Modern React UI with real-time status updates
