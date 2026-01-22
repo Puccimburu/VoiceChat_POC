@@ -27,7 +27,7 @@ print("\n✓ Model downloaded")
 # Download config
 print("Downloading config file...")
 response = requests.get(CONFIG_URL)
-with open('en_US-lessac-medium.onnx.json', 'w') as f:
+with open('en_US-lessac-medium.onnx.json', 'w', encoding='utf-8') as f:
     f.write(response.text)
 
 print("✓ Config downloaded")
