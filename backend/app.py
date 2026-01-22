@@ -11,9 +11,15 @@ import io
 import traceback
 import logging
 import subprocess
+import threading
+import numpy as np
+import imageio_ffmpeg
 
 # Load environment variables
 load_dotenv()
+
+# Get ffmpeg path from imageio-ffmpeg
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -56,17 +62,38 @@ def transcribe():
         logger.info(f"Received audio data, length: {len(audio_data)}")
 
         audio_bytes = base64.b64decode(audio_data.split(',')[1])
-        logger.info(f"Decoded audio bytes, length: {len(audio_bytes)}")
+        logger.info(f"Decoded audio bytes, length: {len(audio_bytes)} bytes ({len(audio_bytes)/1024:.2f} KB)")
 
-        # Save audio file
-        with open(WAVE_OUTPUT_FILENAME, 'wb') as f:
-            f.write(audio_bytes)
-        logger.info(f"Saved audio to {WAVE_OUTPUT_FILENAME}")
+        # Process audio in-memory (FAST - no disk I/O, no file saved)
+        logger.info("Converting audio to NumPy array (in-memory)...")
 
-        # Transcribe with faster-whisper (4x faster)
-        logger.info("Starting transcription with faster-whisper...")
+        # Use ffmpeg directly to convert audio to raw PCM (bypasses pydub's ffprobe dependency)
+        ffmpeg_cmd = [
+            ffmpeg_path,
+            '-i', 'pipe:0',  # Read from stdin
+            '-f', 's16le',   # Output format: signed 16-bit little-endian PCM
+            '-acodec', 'pcm_s16le',
+            '-ar', '16000',  # Sample rate: 16kHz
+            '-ac', '1',      # Channels: mono
+            'pipe:1'         # Write to stdout
+        ]
+
+        # Run ffmpeg process
+        process = subprocess.run(
+            ffmpeg_cmd,
+            input=audio_bytes,
+            capture_output=True,
+            check=True
+        )
+
+        # Convert raw PCM bytes to NumPy array
+        audio_array = np.frombuffer(process.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        logger.info(f"Converted to NumPy: {len(audio_array)} samples, duration: {len(audio_array)/16000:.2f}s")
+
+        # Transcribe with faster-whisper (4x faster) - directly from NumPy array
+        logger.info("Starting transcription with faster-whisper (in-memory)...")
         segments, info = whisper_model.transcribe(
-            WAVE_OUTPUT_FILENAME,
+            audio_array,  # NumPy array instead of filename - NO DISK I/O!
             language="en",
             temperature=0.0,
             condition_on_previous_text=False
@@ -107,7 +134,7 @@ def speak():
         text = request.json['text']
         logger.info(f"Speaking text: {text[:50]}...")
 
-        # Text to speech with Piper (much better quality than pyttsx3)
+        # Generate TTS to a temporary file, then read it
         output_file = "tts_output.wav"
 
         # Run Piper TTS with downloaded model
@@ -118,15 +145,18 @@ def speak():
             check=True
         )
 
-        # Play the audio file
-        if os.name == 'nt':  # Windows
-            os.system(f'start /min "" "{output_file}"')
-        else:  # Linux/Mac
-            subprocess.run(['aplay', output_file])
+        # Read the WAV file and send to browser
+        with open(output_file, 'rb') as f:
+            audio_data = f.read()
 
-        logger.info("Speech completed")
+        # Convert to base64 for browser playback
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+        logger.info(f"TTS audio generated: {len(audio_data)} bytes")
 
-        return jsonify({'status': 'success'})
+        return jsonify({
+            'status': 'success',
+            'audio': f'data:audio/wav;base64,{audio_base64}'
+        })
 
     except Exception as e:
         logger.error(f"Error in speak: {str(e)}")

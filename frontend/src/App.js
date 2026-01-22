@@ -76,15 +76,30 @@ function App() {
         });
 
         const assistantText = chatResponse.data.response;
+
+        // Speak response and show text simultaneously
+        setStatus('🔊 Speaking...');
         setMessages(prev => [...prev, { role: 'assistant', text: assistantText }]);
 
-        // Speak response
-        setStatus('🔊 Speaking...');
-        await axios.post('/api/speak', {
+        // Get TTS audio from backend
+        const speakResponse = await axios.post('/api/speak', {
           text: assistantText
         });
 
-        setStatus('✅ Ready');
+        // Play audio in browser
+        const audio = new Audio(speakResponse.data.audio);
+        audio.play();
+
+        // Wait for audio to finish before setting Ready
+        audio.onended = () => {
+          setStatus('✅ Ready');
+        };
+
+        // Handle errors
+        audio.onerror = () => {
+          console.error('Audio playback error');
+          setStatus('✅ Ready');
+        };
       };
 
     } catch (error) {

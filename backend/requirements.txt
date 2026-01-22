@@ -7,3 +7,4 @@ python-dotenv==1.0.0
 webrtcvad==2.0.10
 imageio-ffmpeg>=0.6.0
 piper-tts>=1.2.0
+numpy>=1.24.0
