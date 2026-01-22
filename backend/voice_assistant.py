@@ -4,7 +4,6 @@ from faster_whisper import WhisperModel
 import google.generativeai as genai
 import os
 from dotenv import load_dotenv
-import webrtcvad
 import subprocess
 
 # Load environment variables
@@ -14,7 +13,7 @@ load_dotenv()
 AUDIO_FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-CHUNK = 480  # 30ms frames for VAD (16000 * 0.03)
+CHUNK = 1024
 MAX_RECORD_SECONDS = 10  # Maximum recording time
 WAVE_OUTPUT_FILENAME = "voice_input.wav"
 
@@ -30,11 +29,8 @@ print("Loading faster-whisper model...")
 whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
 print("Whisper model loaded!")
 
-# Initialize Voice Activity Detection
-vad = webrtcvad.Vad(3)  # Aggressiveness mode (0-3, 3 is most aggressive)
-
 def record_audio():
-    """Record audio with Voice Activity Detection - stops when you stop talking"""
+    """Record audio for fixed duration"""
     audio = pyaudio.PyAudio()
 
     stream = audio.open(format=AUDIO_FORMAT,
@@ -45,31 +41,13 @@ def record_audio():
 
     print("Listening... (speak now)")
     frames = []
-    silence_threshold = 20  # Number of silent frames before stopping
-    silent_frames = 0
-    speech_started = False
     max_frames = int(RATE / CHUNK * MAX_RECORD_SECONDS)
 
     for _ in range(max_frames):
         data = stream.read(CHUNK)
         frames.append(data)
 
-        # Check if this frame contains speech
-        is_speech = vad.is_speech(data, RATE)
-
-        if is_speech:
-            speech_started = True
-            silent_frames = 0
-        elif speech_started:
-            silent_frames += 1
-
-        # Stop if we've detected enough silence after speech started
-        if speech_started and silent_frames > silence_threshold:
-            print("Recording finished (silence detected)")
-            break
-
-    if not speech_started:
-        print("No speech detected")
+    print("Recording finished")
 
     stream.stop_stream()
     stream.close()

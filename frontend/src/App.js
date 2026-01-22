@@ -19,6 +19,7 @@ function App() {
           sampleRate: 16000
         }
       });
+
       mediaRecorderRef.current = new MediaRecorder(stream);
       audioChunksRef.current = [];
 
@@ -28,25 +29,24 @@ function App() {
 
       mediaRecorderRef.current.onstop = async () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        await processAudio(audioBlob);
         stream.getTracks().forEach(track => track.stop());
+        await processAudio(audioBlob);
       };
 
       mediaRecorderRef.current.start();
       setIsRecording(true);
       setStatus('🔴 Recording...');
 
-      // Stop after 5 seconds
-      setTimeout(() => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-          mediaRecorderRef.current.stop();
-          setIsRecording(false);
-        }
-      }, 5000);
-
     } catch (error) {
       setStatus('❌ Microphone access denied');
       console.error('Error accessing microphone:', error);
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
     }
   };
 
@@ -119,10 +119,10 @@ function App() {
 
         <button
           className={`record-button ${isRecording ? 'recording' : ''}`}
-          onClick={startRecording}
-          disabled={isRecording || isProcessing}
+          onClick={isRecording ? stopRecording : startRecording}
+          disabled={isProcessing}
         >
-          {isRecording ? '🔴 Recording...' : '🎙️ Start Recording'}
+          {isRecording ? '⏹️ Stop Recording' : '🎙️ Start Recording'}
         </button>
 
         <div className="messages-container">
