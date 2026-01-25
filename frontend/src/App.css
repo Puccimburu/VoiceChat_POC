@@ -1,160 +1,252 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+  background: #ffffff;
+  color: #1a1a1a;
+}
+
 .App {
   min-height: 100vh;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   padding: 20px;
+  position: relative;
 }
 
-.container {
-  background: white;
-  border-radius: 20px;
-  padding: 40px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-  max-width: 700px;
+/* Top message area */
+.message-area {
   width: 100%;
+  max-width: 800px;
+  text-align: center;
+  margin-bottom: 60px;
+  min-height: 200px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 
-h1 {
-  text-align: center;
-  color: #333;
+.greeting {
+  font-size: 18px;
+  color: #666;
   margin-bottom: 20px;
-  font-size: 2.5em;
 }
 
-.status {
-  text-align: center;
-  font-size: 1.2em;
-  margin: 20px 0;
-  padding: 10px;
-  background: #f0f0f0;
-  border-radius: 10px;
-  font-weight: 500;
-  min-height: 45px;
+.response-text {
+  font-size: 24px;
+  line-height: 1.6;
+  color: #1a1a1a;
+  font-weight: 400;
+}
+
+/* Wave animation */
+.wave-container {
+  position: relative;
+  width: 200px;
+  height: 120px;
+  margin: 40px auto;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.record-button {
-  display: block;
-  margin: 30px auto;
-  padding: 20px 40px;
-  font-size: 1.3em;
-  font-weight: bold;
-  color: white;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  border: none;
-  border-radius: 50px;
-  cursor: pointer;
+.wave-bars {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+.bar {
+  width: 6px;
+  height: 20px;
+  background: #ccc;
+  border-radius: 3px;
   transition: all 0.3s ease;
-  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
 }
 
-.record-button:hover:not(:disabled) {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+.wave-bars.listening .bar {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  animation: wave-listening 1.2s ease-in-out infinite;
 }
 
-.record-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
+.wave-bars.listening .bar:nth-child(1) {
+  animation-delay: 0s;
 }
 
-.record-button.recording {
-  background: linear-gradient(135deg, #ff6b6b 0%, #c92a2a 100%);
-  animation: pulse 1.5s infinite;
+.wave-bars.listening .bar:nth-child(2) {
+  animation-delay: 0.1s;
 }
 
-@keyframes pulse {
+.wave-bars.listening .bar:nth-child(3) {
+  animation-delay: 0.2s;
+}
+
+.wave-bars.listening .bar:nth-child(4) {
+  animation-delay: 0.3s;
+}
+
+.wave-bars.listening .bar:nth-child(5) {
+  animation-delay: 0.4s;
+}
+
+.wave-bars.speaking .bar {
+  background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+  animation: wave-speaking 0.6s ease-in-out infinite;
+}
+
+.wave-bars.speaking .bar:nth-child(1) {
+  animation-delay: 0s;
+}
+
+.wave-bars.speaking .bar:nth-child(2) {
+  animation-delay: 0.05s;
+}
+
+.wave-bars.speaking .bar:nth-child(3) {
+  animation-delay: 0.1s;
+}
+
+.wave-bars.speaking .bar:nth-child(4) {
+  animation-delay: 0.15s;
+}
+
+.wave-bars.speaking .bar:nth-child(5) {
+  animation-delay: 0.2s;
+}
+
+@keyframes wave-listening {
   0%, 100% {
-    transform: scale(1);
+    height: 20px;
   }
   50% {
-    transform: scale(1.05);
+    height: 80px;
   }
 }
 
-.messages-container {
-  margin-top: 30px;
+@keyframes wave-speaking {
+  0%, 100% {
+    height: 20px;
+  }
+  50% {
+    height: 100px;
+  }
 }
 
-.messages-container h3 {
-  color: #333;
-  margin-bottom: 15px;
-  font-size: 1.3em;
-}
-
-.messages {
-  background: #f9f9f9;
-  border-radius: 10px;
-  padding: 20px;
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-.empty-state {
+/* Status text */
+.status-text {
   text-align: center;
+  margin-top: 20px;
+  font-size: 14px;
   color: #999;
-  padding: 40px 20px;
-  font-style: italic;
 }
 
-.message {
-  margin-bottom: 20px;
-  padding: 15px;
-  border-radius: 10px;
-  animation: slideIn 0.3s ease;
+/* Control buttons */
+.controls {
+  display: flex;
+  gap: 30px;
+  justify-content: center;
+  margin-top: 40px;
 }
 
-@keyframes slideIn {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+.control-btn {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  background: #f5f5f5;
+  color: #666;
+  font-size: 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
 }
 
-.message.user {
-  background: #e3f2fd;
-  border-left: 4px solid #2196f3;
+.control-btn:hover {
+  background: #e8e8e8;
+  transform: scale(1.05);
 }
 
-.message.assistant {
-  background: #f3e5f5;
-  border-left: 4px solid #9c27b0;
+.control-btn:active {
+  transform: scale(0.95);
 }
 
-.message strong {
-  display: block;
-  margin-bottom: 8px;
+.control-btn.exit {
+  background: #f5f5f5;
+  color: #666;
+}
+
+.control-btn.exit:hover {
+  background: #e8e8e8;
+}
+
+.control-btn.mute {
+  background: #f5f5f5;
+}
+
+.control-btn.mute.active {
+  background: #fee;
+  color: #d00;
+}
+
+/* Voice selector */
+.voice-selector {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.voice-selector label {
+  font-size: 14px;
+  color: #666;
+  font-weight: 500;
+}
+
+.voice-selector select {
+  padding: 8px 16px;
+  border-radius: 20px;
+  border: 1px solid #e0e0e0;
+  background: white;
   color: #333;
+  font-size: 14px;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.2s ease;
 }
 
-.message p {
-  margin: 0;
-  color: #555;
-  line-height: 1.6;
+.voice-selector select:hover:not(:disabled) {
+  border-color: #667eea;
+  background: #f9f9ff;
 }
 
-/* Scrollbar styling */
-.messages::-webkit-scrollbar {
-  width: 8px;
+
+/* End session button */
+.end-session {
+  margin-top: 20px;
+  padding: 12px 24px;
+  border-radius: 24px;
+  border: 1px solid #e0e0e0;
+  background: white;
+  color: #666;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
 }
 
-.messages::-webkit-scrollbar-track {
-  background: #f1f1f1;
-  border-radius: 10px;
-}
-
-.messages::-webkit-scrollbar-thumb {
-  background: #888;
-  border-radius: 10px;
-}
-
-.messages::-webkit-scrollbar-thumb:hover {
-  background: #555;
+.end-session:hover {
+  background: #f5f5f5;
+  border-color: #ccc;
 }
