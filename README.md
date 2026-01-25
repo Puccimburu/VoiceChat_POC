@@ -8,7 +8,6 @@ Python voice assistant with React frontend using local audio processing and Goog
 POC/
 ├── backend/          # Flask API
 │   ├── app.py
-│   ├── voice_assistant.py (CLI version)
 │   └── requirements.txt
 └── frontend/         # React app
     ├── src/
