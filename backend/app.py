@@ -262,6 +262,14 @@ def voice_unified():
         logger.info("Step 1: Transcribing audio + pre-warming Gemini...")
         audio_bytes = base64.b64decode(audio_data.split(',')[1])
 
+        audio_size_bytes = len(audio_bytes)
+        MAX_BYTES = 800000
+        logger.info(f"📊 Audio: {audio_size_bytes/1000:.0f}KB")
+        if audio_size_bytes > MAX_BYTES:
+            logger.warning(f"🚫 REJECTED: {audio_size_bytes/1000:.0f}KB > {MAX_BYTES/1000}KB")
+            return jsonify({'error': 'Audio too long. Speak for 5s max.'}), 400
+        assert audio_size_bytes <= MAX_BYTES, "Audio size check failed"
+
         audio = speech.RecognitionAudio(content=audio_bytes)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
@@ -344,7 +352,7 @@ def voice_unified():
                     logger.info(f" Stream {stream_id} CANCELLED - stopping generation")
                     return
 
-                if chunk.text:
+                if hasattr(chunk, 'text') and chunk.text and chunk.text.strip():
                     if first_chunk_time is None:
                         first_chunk_time = time.time() - gemini_start
                         logger.info(f"⏱  Time to First Token: {first_chunk_time:.3f}s")
