@@ -255,7 +255,7 @@ function App() {
         const base64Audio = reader.result;
 
         // *** CRITICAL: Stop any active streams/audio BEFORE starting new request ***
-        console.log('🛑 NEW REQUEST - Stopping any active streams/audio');
+        console.log(' NEW REQUEST - Stopping any active streams/audio');
 
         // Increment session to invalidate old responses
         sessionIdRef.current += 1;
@@ -552,7 +552,6 @@ function App() {
 
       console.log(' Muted - stopped recording');
     } else {
-      
       // Unmuting: Resume continuous recording
       console.log(' Unmuted - resuming continuous recording');
       setTimeout(() => startListening(), 100);
@@ -644,7 +643,7 @@ function App() {
           value={selectedVoice}
           onChange={(e) => {
             setSelectedVoice(e.target.value);
-            console.log('🎙️ Voice changed - recorder continues running');
+            console.log(' Voice changed - recorder continues running');
           }}
         >
           <option value="en-US-Neural2-A">Male 1 (Warm)</option>
