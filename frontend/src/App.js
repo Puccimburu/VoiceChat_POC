@@ -552,6 +552,7 @@ function App() {
 
       console.log(' Muted - stopped recording');
     } else {
+      
       // Unmuting: Resume continuous recording
       console.log(' Unmuted - resuming continuous recording');
       setTimeout(() => startListening(), 100);
