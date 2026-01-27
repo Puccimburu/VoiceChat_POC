@@ -254,9 +254,50 @@ function App() {
       reader.onloadend = async () => {
         const base64Audio = reader.result;
 
-        // Capture current session ID - only this session's responses will be rendered
+        // *** CRITICAL: Stop any active streams/audio BEFORE starting new request ***
+        console.log('🛑 NEW REQUEST - Stopping any active streams/audio');
+
+        // Increment session to invalidate old responses
+        sessionIdRef.current += 1;
         const currentSessionId = sessionIdRef.current;
         console.log(` Starting new request with session ID: ${currentSessionId}`);
+
+        // Cancel backend stream if exists
+        if (currentStreamIdRef.current) {
+          try {
+            console.log(` Cancelling backend stream ${currentStreamIdRef.current}`);
+            await fetch(`http://localhost:5000/api/cancel/${currentStreamIdRef.current}`, {
+              method: 'POST'
+            });
+          } catch (e) {
+            console.log('Error cancelling stream:', e);
+          }
+          currentStreamIdRef.current = null;
+        }
+
+        // Clear all active timeouts (word-by-word rendering)
+        activeTimeoutsRef.current.forEach(timeoutId => clearTimeout(timeoutId));
+        activeTimeoutsRef.current = [];
+
+        // Stop current audio immediately
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current.currentTime = 0;
+          currentAudioRef.current = null;
+        }
+
+        // Clear audio queue
+        audioQueueRef.current = [];
+
+        // Cancel streaming response reader
+        if (streamReaderRef.current) {
+          try {
+            streamReaderRef.current.cancel();
+          } catch (e) {
+            console.log('Stream already cancelled');
+          }
+          streamReaderRef.current = null;
+        }
 
         // Clear previous response and start streaming
         setResponseText('');
