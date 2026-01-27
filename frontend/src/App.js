@@ -8,6 +8,7 @@ function App() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [selectedVoice, setSelectedVoice] = useState('en-US-Neural2-J'); // Default male voice
+  const selectedVoiceRef = useRef('en-US-Neural2-J'); // Ref to always get current voice
   const [isMonitoring, setIsMonitoring] = useState(false); // New: track if mic is monitoring
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
@@ -414,12 +415,13 @@ function App() {
 
         // Unified voice pipeline: Send audio directly, get streaming TTS response
         console.log('Sending audio to unified voice endpoint');
+        console.log(' Using voice:', selectedVoiceRef.current);
         const response = await fetch('/api/voice', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             audio: base64Audio,
-            voice: selectedVoice
+            voice: selectedVoiceRef.current  // Use ref instead of state
           })
         });
 
@@ -642,8 +644,10 @@ function App() {
           id="voice"
           value={selectedVoice}
           onChange={(e) => {
-            setSelectedVoice(e.target.value);
-            console.log(' Voice changed - recorder continues running');
+            const newVoice = e.target.value;
+            setSelectedVoice(newVoice);
+            selectedVoiceRef.current = newVoice;  // Update ref immediately
+            console.log(' Voice changed to:', newVoice);
           }}
         >
           <option value="en-US-Neural2-A">Male 1 (Warm)</option>

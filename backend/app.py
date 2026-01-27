@@ -93,6 +93,7 @@ def voice_unified():
         # Get audio and voice preference
         audio_data = request.json['audio']
         selected_voice = request.json.get('voice', 'en-US-Neural2-J')
+        logger.info(f" Selected voice: {selected_voice}")
 
         logger.info(f"=== Starting unified voice pipeline (stream {stream_id}, session {session_id[:8]}) ===")
         pipeline_start = time.time()
