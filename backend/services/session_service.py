@@ -31,9 +31,12 @@ def get_or_create_session(session_id=None):
         del sessions[sid]
         logger.info(f"🧹 Cleaned up expired session {sid}")
 
-    # Create new session if needed
-    if not session_id or session_id not in sessions:
+    # Generate ID only if none provided
+    if not session_id:
         session_id = str(uuid.uuid4())
+
+    # Create session entry if it doesn't exist yet
+    if session_id not in sessions:
         sessions[session_id] = {
             'history': deque(maxlen=MAX_HISTORY),
             'variables': {},
@@ -70,9 +73,10 @@ def build_context_prompt(session_data, current_message):
     if not session_data['history']:
         return current_message
 
-    # Build conversation history
+    # Build conversation history (limit to last 5 exchanges for performance)
     history_text = "Previous conversation:\n"
-    for exchange in session_data['history']:
+    recent_history = list(session_data['history'])[-5:]  # Only last 5 exchanges
+    for exchange in recent_history:
         history_text += f"User: {exchange['user']}\n"
         history_text += f"Assistant: {exchange['assistant']}\n\n"
 
