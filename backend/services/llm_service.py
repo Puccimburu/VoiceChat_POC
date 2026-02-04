@@ -1,33 +1,23 @@
 """LLM (Gemini) service"""
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_SYSTEM_INSTRUCTION
 
 logger = logging.getLogger(__name__)
 
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(
-    GEMINI_MODEL,
-    system_instruction=GEMINI_SYSTEM_INSTRUCTION
-)
+client = genai.Client(api_key=GEMINI_API_KEY)
+_config = types.GenerateContentConfig(systemInstruction=GEMINI_SYSTEM_INSTRUCTION)
 
 
 def prewarm_gemini():
     """Pre-warm Gemini connection to reduce TTFB"""
     try:
-        gemini_model.generate_content("hi", stream=False)
+        client.models.generate_content(model=GEMINI_MODEL, contents="hi", config=_config)
     except Exception:
         pass  # Ignore errors, this is just for warming
 
 
 def generate_response_stream(prompt):
-    """Generate streaming response from Gemini
-
-    Args:
-        prompt: Input prompt with context
-
-    Returns:
-        Generator yielding response chunks
-    """
-    return gemini_model.generate_content(prompt, stream=True)
+    """Generate streaming response from Gemini"""
+    return client.models.generate_content_stream(model=GEMINI_MODEL, contents=prompt, config=_config)

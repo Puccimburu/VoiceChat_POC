@@ -3,7 +3,7 @@ import logging
 import time
 import os
 from google.cloud import speech
-from config import STT_LANGUAGE, STT_MODEL, CHUNK_SIZE
+from config import STT_LANGUAGE, STT_MODEL
 
 # Workaround for SSL/gRPC issues on Python 3.14
 os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
@@ -11,8 +11,9 @@ os.environ.setdefault('GRPC_POLL_STRATEGY', 'poll')
 
 logger = logging.getLogger(__name__)
 
-# Global client - will be recreated on connection errors
+# Global client - recreated on connection errors
 _speech_client = None
+
 
 def get_speech_client(force_new=False):
     """Get or create speech client"""
@@ -65,10 +66,10 @@ def transcribe_audio(audio_bytes, encoding=None):
             if response.results:
                 transcript = " ".join([result.alternatives[0].transcript for result in response.results]).strip()
                 if transcript:
-                    logger.info(f"✅ STT completed in {elapsed:.3f}s")
+                    logger.info(f" STT completed in {elapsed:.3f}s")
                     return transcript
 
-            logger.warning(f"⚠️ Empty transcript ({elapsed:.3f}s)")
+            logger.warning(f" Empty transcript ({elapsed:.3f}s)")
             return ""
 
         except Exception as e:
@@ -83,11 +84,11 @@ def transcribe_audio(audio_bytes, encoding=None):
             if is_transient and retry_count < max_retries:
                 retry_count += 1
                 wait_time = 0.2 * retry_count
-                logger.warning(f"⚠️ STT error, retrying ({retry_count}/{max_retries}) in {wait_time}s: {type(e).__name__}")
+                logger.warning(f" STT error, retrying ({retry_count}/{max_retries}) in {wait_time}s: {type(e).__name__}")
                 time.sleep(wait_time)
                 continue
 
-            logger.error(f"❌ STT failed after {retry_count} retries: {e}")
+            logger.error(f" STT failed after {retry_count} retries: {e}")
             return ""
 
     return ""
