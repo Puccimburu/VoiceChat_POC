@@ -231,7 +231,7 @@ function AppStreaming() {
             }
           }
         }
-      } else if (average < SILENCE_THRESHOLD && streamingRef.current) {
+      } else if (average <= SPEECH_THRESHOLD && streamingRef.current) {
         // Track silence duration
         if (!silenceStartTime) {
           silenceStartTime = now;
