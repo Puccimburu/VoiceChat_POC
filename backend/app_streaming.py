@@ -20,11 +20,12 @@ from google.cloud import speech
 
 load_dotenv()
 
-from services.session_service import get_or_create_session, add_to_conversation_history, build_context_prompt
+from services.session_service import get_or_create_session, add_to_conversation_history, build_context_prompt, build_rag_prompt
 from services.stt_service import transcribe_audio
 from services.llm_service import generate_response_stream
 from services.tts_service import synthesize_sentence_with_timing
 from services.streaming_stt_service import StreamingSTT, last_stream_had_error
+from services.qdrant_service import voice_search
 
 # Per-client streaming STT sessions
 streaming_sessions = {}
@@ -146,11 +147,13 @@ def handle_start_stream(data):
 
     # Store session data
     session_id, session_data = get_or_create_session(session_id)
+    mode = data.get('mode', 'general')  # 'general' or 'document'
     streaming_sessions[sid] = {
         'stt': stt,
         'session_id': session_id,
         'session_data': session_data,
         'voice': selected_voice,
+        'mode': mode,
         'start_time': time.time()
     }
 
@@ -193,6 +196,7 @@ def handle_end_speech(data):
     session_id = session['session_id']
     session_data = session['session_data']
     selected_voice = session['voice']
+    mode = session.get('mode', 'general')
     pipeline_start = session['start_time']
     request_id = data.get('request_id')
 
@@ -236,8 +240,13 @@ def handle_end_speech(data):
 
     # --- LLM + TTS pipeline ---
     try:
-        prompt = build_context_prompt(session_data, transcript)
-        logger.info(f"Gemini input: ~{len(prompt.split())} words")
+        if mode == 'document':
+            qdrant_results = voice_search(transcript)
+            logger.info(f"Qdrant returned {len(qdrant_results)} chunks")
+            prompt = build_rag_prompt(session_data, transcript, qdrant_results)
+        else:
+            prompt = build_context_prompt(session_data, transcript)
+        logger.info(f"Gemini input ({mode} mode): ~{len(prompt.split())} words")
 
         response_stream = generate_response_stream(prompt)
         llm_start = time.time()
