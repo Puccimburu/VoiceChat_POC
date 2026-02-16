@@ -4,7 +4,7 @@ import threading
 from google import genai
 from google.genai import types
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
 from config import QDRANT_CLUSTER_URL, QDRANT_API_KEY, QDRANT_COLLECTION_NAME, GEMINI_API_KEY
 
 VECTOR_SIZE = 768
@@ -89,11 +89,34 @@ def get_qdrant_client():
 # ---------------------------------------------------------------------------
 # Voice search — search collection by transcript
 # ---------------------------------------------------------------------------
-def voice_search(query, top_k=64):
-    """Embed the query with Gemini and search for relevant document chunks."""
+def voice_search(query, top_k=64, document_filter=None):
+    """Embed the query with Gemini and search for relevant document chunks.
+
+    Args:
+        query: The search query text
+        top_k: Maximum number of results to return
+        document_filter: Optional document filename to filter results by
+    """
     query_vector = gemini_embed(query)
 
     client = get_qdrant_client()
+
+    # Build filter if document_filter is specified
+    # Check both 'source' and 'source_file' for backward compatibility
+    query_filter = None
+    if document_filter:
+        query_filter = Filter(
+            should=[
+                FieldCondition(
+                    key="source",
+                    match=MatchValue(value=document_filter)
+                ),
+                FieldCondition(
+                    key="source_file",
+                    match=MatchValue(value=document_filter)
+                )
+            ]
+        )
 
     # Retry logic for transient SSL errors
     max_retries = 3
@@ -103,6 +126,7 @@ def voice_search(query, top_k=64):
                 collection_name=QDRANT_COLLECTION_NAME,
                 query=query_vector,
                 limit=top_k,
+                query_filter=query_filter,
             )
             return results.points
         except Exception as e:
@@ -146,3 +170,153 @@ def recreate_voice_collection():
     info = client.get_collection(QDRANT_COLLECTION_NAME)
     print(f"Recreated '{QDRANT_COLLECTION_NAME}': vector size {info.config.params.vectors.size}")
     return info
+
+# ---------------------------------------------------------------------------
+# Get list of documents in collection
+# ---------------------------------------------------------------------------
+def get_document_list():
+    """Retrieve unique document names from the Qdrant collection."""
+    client = get_qdrant_client()
+    try:
+        # Get collection info first
+        collection_info = client.get_collection(QDRANT_COLLECTION_NAME)
+        print(f"Collection '{QDRANT_COLLECTION_NAME}' has {collection_info.points_count} points")
+
+        # Scroll through all points to get unique document names
+        documents = set()
+        offset = None
+        limit = 100
+        total_points_scanned = 0
+
+        while True:
+            result = client.scroll(
+                collection_name=QDRANT_COLLECTION_NAME,
+                limit=limit,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            points, next_offset = result
+            total_points_scanned += len(points)
+
+            # Debug: print first few payloads to see structure
+            if total_points_scanned <= 3:
+                for i, point in enumerate(points[:3]):
+                    print(f"Sample point {i+1} payload keys: {list(point.payload.keys()) if point.payload else 'None'}")
+                    if point.payload:
+                        print(f"  Payload: {point.payload}")
+
+            for point in points:
+                if point.payload:
+                    # Check for 'source' or 'source_file' for backward compatibility
+                    source = point.payload.get('source') or point.payload.get('source_file')
+                    if source:
+                        # Extract just the filename from the path
+                        filename = source.split('/')[-1] if '/' in source else source.split('\\')[-1]
+                        documents.add(filename)
+                        print(f"Found document: {filename}")
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        print(f"Scanned {total_points_scanned} points, found {len(documents)} unique documents: {sorted(documents)}")
+        return sorted(list(documents))
+    except Exception as e:
+        print(f"Error retrieving document list: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+# ---------------------------------------------------------------------------
+# Upload single document
+# ---------------------------------------------------------------------------
+def upload_document(file_content, filename):
+    """Upload a single PDF document to Qdrant collection.
+
+    Args:
+        file_content: Binary content of the PDF file
+        filename: Name of the file
+
+    Returns:
+        dict: Status with 'success' bool and 'message' string
+    """
+    from PyPDF2 import PdfReader
+    from qdrant_client.http.models import PointStruct
+    import io
+
+    try:
+        # Extract text from PDF
+        pdf_reader = PdfReader(io.BytesIO(file_content))
+        text = ""
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+
+        if not text.strip():
+            return {"success": False, "message": "No text could be extracted from the PDF"}
+
+        # Chunk the text
+        def chunk_text(text, chunk_size=200, overlap=0):
+            words = text.split()
+            chunks = []
+            start = 0
+            while start < len(words):
+                end = start + chunk_size
+                chunk = " ".join(words[start:end])
+                if chunk.strip():
+                    chunks.append(chunk)
+                start += chunk_size - overlap
+            return chunks
+
+        chunks = chunk_text(text, chunk_size=200, overlap=0)
+        print(f"Processing {filename}: {len(text)} chars, {len(chunks)} chunks")
+
+        # Get next available point ID
+        client = get_qdrant_client()
+        collection_info = client.get_collection(QDRANT_COLLECTION_NAME)
+        next_point_id = collection_info.points_count
+
+        # Embed in batches
+        BATCH_SIZE = 20
+        points = []
+
+        for batch_start in range(0, len(chunks), BATCH_SIZE):
+            batch_chunks = chunks[batch_start:batch_start + BATCH_SIZE]
+            vectors = gemini_embed_batch(batch_chunks)
+
+            for i, (chunk, vector) in enumerate(zip(batch_chunks, vectors)):
+                point = PointStruct(
+                    id=next_point_id,
+                    vector=vector,
+                    payload={
+                        "document_name": filename,
+                        "chunk_index": batch_start + i,
+                        "text": chunk,
+                        "source": filename,
+                    },
+                )
+                points.append(point)
+                next_point_id += 1
+
+        # Upsert all points
+        for batch_start in range(0, len(points), 100):
+            batch = points[batch_start:batch_start + 100]
+            client.upsert(
+                collection_name=QDRANT_COLLECTION_NAME,
+                wait=True,
+                points=batch,
+            )
+
+        return {
+            "success": True,
+            "message": f"Successfully uploaded {filename} ({len(chunks)} chunks)",
+            "filename": filename,
+            "chunks": len(chunks)
+        }
+
+    except Exception as e:
+        print(f"Error uploading document: {e}")
+        return {"success": False, "message": f"Upload failed: {str(e)}"}

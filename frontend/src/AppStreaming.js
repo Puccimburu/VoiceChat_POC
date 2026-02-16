@@ -16,6 +16,12 @@ function AppStreaming() {
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [mode, setMode] = useState('general');  // 'general' or 'document'
   const modeRef = useRef('general');
+  const [documents, setDocuments] = useState([]);
+  const [selectedDocument, setSelectedDocument] = useState('all');
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef(null);
+  const [conversationHistory, setConversationHistory] = useState([]);
+  const chatEndRef = useRef(null);
 
   const socketRef = useRef(null);
   const mediaRecorderRef = useRef(null);
@@ -87,10 +93,48 @@ function AppStreaming() {
       console.error(' Server error:', data.message);
     });
 
+    socketRef.current.on('documents_list', (data) => {
+      console.log('📄 Received documents list:', data.documents);
+      console.log('📄 Number of documents:', data.documents?.length || 0);
+      if (data.documents && data.documents.length > 0) {
+        console.log('📄 Documents:', data.documents);
+      } else {
+        console.warn('⚠️ No documents received or empty list');
+      }
+      setDocuments(data.documents || []);
+    });
+
+    socketRef.current.on('conversation_pair', (data) => {
+      console.log('💬 Received conversation pair:', data);
+      setConversationHistory(prev => [...prev, {
+        user: data.user_query,
+        assistant: data.llm_response,
+        timestamp: new Date().toISOString()
+      }]);
+    });
+
     return () => {
       socketRef.current?.disconnect();
     };
   }, []);
+
+  // Fetch documents when entering document mode
+  useEffect(() => {
+    if (mode === 'document' && socketRef.current) {
+      console.log('📄 Requesting documents list');
+      socketRef.current.emit('get_documents');
+    } else if (mode === 'general') {
+      // Clear conversation history when switching to general mode
+      setConversationHistory([]);
+    }
+  }, [mode]);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [conversationHistory]);
 
   const playNextAudio = async () => {
     if (currentAudioRef.current || audioQueueRef.current.length === 0) {
@@ -166,7 +210,7 @@ function AppStreaming() {
     const dataArray = new Uint8Array(bufferLength);
     const SILENCE_THRESHOLD = 0.4;   // For detecting silence
     const SPEECH_THRESHOLD = 2.5;    // Higher threshold to avoid false triggers from breathing
-    const SILENCE_DURATION_MS = 300; // Stop after 300ms of sustained silence
+    const SILENCE_DURATION_MS = 1000; // Stop after 300ms of sustained silence
     let lastLogTime = 0;
     let silenceStartTime = null;
 
@@ -227,7 +271,8 @@ function AppStreaming() {
                 session_id: sessionIdRef.current,
                 voice: selectedVoiceRef.current,
                 mimeType: 'audio/pcm',  // signals LINEAR16 @ 48kHz
-                mode: modeRef.current   // 'general' or 'document'
+                mode: modeRef.current,   // 'general' or 'document'
+                selectedDocument: selectedDocument  // selected document for filtering
               });
               mediaRecorderRef.current.start();  // no timeslice — blob kept for fallback only
               console.log(' Streaming recording started (PCM via ScriptProcessor)');
@@ -435,13 +480,90 @@ function AppStreaming() {
     setResponseText('');
   };
 
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      alert('Please select a PDF file');
+      return;
+    }
+
+    setIsUploading(true);
+    console.log('📄 Uploading document:', file.name);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('http://localhost:5000/upload_document', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        console.log('✅ Upload successful:', result.message);
+        // Refresh documents list
+        socketRef.current.emit('get_documents');
+        // Auto-select the newly uploaded document
+        setSelectedDocument(result.filename);
+        alert(`Successfully uploaded: ${result.filename}`);
+      } else {
+        console.error('❌ Upload failed:', result.message);
+        alert(`Upload failed: ${result.message}`);
+      }
+    } catch (error) {
+      console.error('❌ Upload error:', error);
+      alert(`Upload error: ${error.message}`);
+    } finally {
+      setIsUploading(false);
+      // Reset file input
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
   return (
     <div className="App">
-      <div className="message-area">
-        {responseText && (
-          <div className="response-text">{responseText}</div>
-        )}
-      </div>
+      {mode === 'document' ? (
+        <div className="chat-container">
+          <div className="chat-history">
+            {conversationHistory.length === 0 ? (
+              <div className="chat-empty">
+                <i className="fas fa-comments"></i>
+                <p>Start a conversation by asking a question about your documents</p>
+              </div>
+            ) : (
+              conversationHistory.map((msg, index) => (
+                <div key={index} className="chat-message-group">
+                  <div className="chat-message user-message">
+                    <div className="message-icon">
+                      <i className="fas fa-user"></i>
+                    </div>
+                    <div className="message-content">{msg.user}</div>
+                  </div>
+                  <div className="chat-message assistant-message">
+                    <div className="message-icon">
+                      <i className="fas fa-robot"></i>
+                    </div>
+                    <div className="message-content">{msg.assistant}</div>
+                  </div>
+                </div>
+              ))
+            )}
+            <div ref={chatEndRef} />
+          </div>
+        </div>
+      ) : (
+        <div className="message-area">
+          {responseText && (
+            <div className="response-text">{responseText}</div>
+          )}
+        </div>
+      )}
 
       <div className="wave-container">
         <div className={`wave-bars ${isListening ? 'listening' : ''} ${isSpeaking ? 'speaking' : ''}`}>
@@ -512,6 +634,44 @@ function AppStreaming() {
           <option value="en-US-Neural2-H">Female 5 (Calm)</option>
         </select>
       </div>
+
+      {mode === 'document' && (
+        <div className="document-selector">
+          <label htmlFor="document">Document:</label>
+          <select
+            id="document"
+            value={selectedDocument}
+            onChange={(e) => {
+              const newDocument = e.target.value;
+              setSelectedDocument(newDocument);
+              console.log('📄 Document changed to:', newDocument);
+            }}
+            disabled={isUploading}
+          >
+            <option value="all">All Documents</option>
+            {documents.map((doc) => (
+              <option key={doc} value={doc}>
+                {doc}
+              </option>
+            ))}
+          </select>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf"
+            onChange={handleFileUpload}
+            style={{ display: 'none' }}
+          />
+          <button
+            className="upload-doc-btn"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isUploading}
+            title="Upload PDF document"
+          >
+            <i className={`fas ${isUploading ? 'fa-spinner fa-spin' : 'fa-upload'}`}></i>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

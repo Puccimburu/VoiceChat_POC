@@ -25,7 +25,7 @@ from services.stt_service import transcribe_audio
 from services.llm_service import generate_response_stream
 from services.tts_service import synthesize_sentence_with_timing
 from services.streaming_stt_service import StreamingSTT, last_stream_had_error
-from services.qdrant_service import voice_search
+from services.qdrant_service import voice_search, get_document_list, upload_document
 
 # Per-client streaming STT sessions
 streaming_sessions = {}
@@ -77,6 +77,41 @@ def serve():
     return send_from_directory(app.static_folder, 'index.html')
 
 
+@app.route('/upload_document', methods=['POST'])
+def handle_upload_document():
+    """Handle document upload and add to Qdrant collection"""
+    try:
+        if 'file' not in request.files:
+            return {'success': False, 'message': 'No file provided'}, 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return {'success': False, 'message': 'No file selected'}, 400
+
+        if not file.filename.lower().endswith('.pdf'):
+            return {'success': False, 'message': 'Only PDF files are supported'}, 400
+
+        # Read file content
+        file_content = file.read()
+        filename = file.filename
+
+        logger.info(f"Uploading document: {filename} ({len(file_content)} bytes)")
+
+        # Upload to Qdrant
+        result = upload_document(file_content, filename)
+
+        if result['success']:
+            logger.info(f"Successfully uploaded: {filename}")
+            return result, 200
+        else:
+            logger.error(f"Upload failed: {result['message']}")
+            return result, 500
+
+    except Exception as e:
+        logger.error(f"Error handling upload: {e}", exc_info=True)
+        return {'success': False, 'message': str(e)}, 500
+
+
 # --- Socket events ---
 
 @socketio.on('connect')
@@ -114,6 +149,19 @@ def handle_barge_in(data):
         del streaming_sessions[sid]
 
 
+@socketio.on('get_documents')
+def handle_get_documents():
+    """Return list of documents in Qdrant collection"""
+    sid = request.sid
+    logger.info(f"Getting document list for {sid}")
+    try:
+        documents = get_document_list()
+        emit('documents_list', {'documents': documents})
+    except Exception as e:
+        logger.error(f"Error getting documents: {e}")
+        emit('error', {'message': f'Failed to retrieve documents: {str(e)}'})
+
+
 # --- Streaming STT handlers ---
 
 @socketio.on('start_stream')
@@ -148,12 +196,14 @@ def handle_start_stream(data):
     # Store session data
     session_id, session_data = get_or_create_session(session_id)
     mode = data.get('mode', 'general')  # 'general' or 'document'
+    selected_document = data.get('selectedDocument', 'all')  # selected document for filtering
     streaming_sessions[sid] = {
         'stt': stt,
         'session_id': session_id,
         'session_data': session_data,
         'voice': selected_voice,
         'mode': mode,
+        'selected_document': selected_document,
         'start_time': time.time()
     }
 
@@ -197,6 +247,7 @@ def handle_end_speech(data):
     session_data = session['session_data']
     selected_voice = session['voice']
     mode = session.get('mode', 'general')
+    selected_document = session.get('selected_document', 'all')
     pipeline_start = session['start_time']
     request_id = data.get('request_id')
 
@@ -241,8 +292,11 @@ def handle_end_speech(data):
     # --- LLM + TTS pipeline ---
     try:
         if mode == 'document':
-            qdrant_results = voice_search(transcript)
-            logger.info(f"Qdrant returned {len(qdrant_results)} chunks")
+            # Pass selected_document filter to voice_search
+            filter_doc = None if selected_document == 'all' else selected_document
+            qdrant_results = voice_search(transcript, document_filter=filter_doc)
+            logger.info(f"Qdrant returned {len(qdrant_results)} chunks" +
+                       (f" (filtered by: {selected_document})" if filter_doc else ""))
             prompt = build_rag_prompt(session_data, transcript, qdrant_results)
         else:
             prompt = build_context_prompt(session_data, transcript)
@@ -314,6 +368,14 @@ def handle_end_speech(data):
 
         add_to_conversation_history(session_id, transcript, full_ai_response.strip())
         logger.info(f"Saved to session {session_id[:8]}")
+
+        # Send conversation pair to frontend (for document mode chat history)
+        if mode == 'document':
+            emit('conversation_pair', {
+                'user_query': transcript,
+                'llm_response': full_ai_response.strip()
+            })
+
         emit('stream_complete', {'status': 'done', 'session_id': session_id})
 
     except Exception as e:
