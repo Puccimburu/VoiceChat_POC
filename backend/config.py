@@ -8,6 +8,10 @@ load_dotenv()
 # API Keys
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Platform database (stores customers, API keys, db configs)
+PLATFORM_MONGO_URI = os.environ.get("PLATFORM_MONGO_URI", "mongodb://localhost:27017/")
+PLATFORM_DB        = os.environ.get("PLATFORM_DB", "Test")
+
 # Session Configuration
 SESSION_TIMEOUT = 24 * 60 * 60  # 24 hours in seconds
 MAX_HISTORY = 5  # Keep last 5 conversation exchanges

@@ -43,5 +43,22 @@ voice_input.wav
 # Build
 frontend/build/
 
+# Go compiled binaries
+backend-go/*.exe
+backend-go/voice-gateway
+
+# CRA build artifacts that land in public/
+frontend/public/static/
+
+# VAD / ONNX runtime binaries (large, fetched at build time)
+frontend/public/ort-wasm-simd-threaded.jsep.mjs
+frontend/public/ort-wasm-simd-threaded.jsep.wasm
+frontend/public/ort-wasm-simd-threaded.mjs
+frontend/public/ort-wasm-simd-threaded.wasm
+frontend/public/vad.worklet.bundle.min.js
+
+# Claude
+.claude/
+
 # Logs
 *.log

@@ -84,6 +84,16 @@ def get_qdrant_client():
                     api_key=QDRANT_API_KEY,
                 )
                 print(f"Qdrant client initialized in {time.perf_counter() - start:.2f}s")
+                # Ensure payload index exists on 'source' field (required for document filtering)
+                try:
+                    _qdrant_client.create_payload_index(
+                        collection_name=QDRANT_COLLECTION_NAME,
+                        field_name="source",
+                        field_schema="keyword",
+                    )
+                    print("Payload index on 'source' created (or already exists)")
+                except Exception as idx_err:
+                    print(f"Payload index warning (safe to ignore if index exists): {idx_err}")
     return _qdrant_client
 
 # ---------------------------------------------------------------------------
@@ -102,17 +112,13 @@ def voice_search(query, top_k=64, document_filter=None):
     client = get_qdrant_client()
 
     # Build filter if document_filter is specified
-    # Check both 'source' and 'source_file' for backward compatibility
     query_filter = None
     if document_filter:
+        print(f"🔍 Filtering by document: '{document_filter}'")
         query_filter = Filter(
-            should=[
+            must=[
                 FieldCondition(
                     key="source",
-                    match=MatchValue(value=document_filter)
-                ),
-                FieldCondition(
-                    key="source_file",
                     match=MatchValue(value=document_filter)
                 )
             ]
@@ -128,6 +134,14 @@ def voice_search(query, top_k=64, document_filter=None):
                 limit=top_k,
                 query_filter=query_filter,
             )
+
+            # Debug: print which documents were returned
+            if results.points:
+                sources = set(p.payload.get('source', 'unknown') for p in results.points[:5])
+                print(f"📄 Returned {len(results.points)} chunks from documents: {sources}")
+            else:
+                print(f"⚠️ No results found for filter: {document_filter}")
+
             return results.points
         except Exception as e:
             if attempt < max_retries - 1:

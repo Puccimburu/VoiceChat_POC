@@ -1,7 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
 import '@fortawesome/fontawesome-free/css/all.min.css';
-import io from 'socket.io-client';
+import { MicVAD } from '@ricky0123/vad-web';
+
+const WS_URL     = process.env.REACT_APP_WS_URL     || 'ws://localhost:8080/ws';
+const API_KEY    = process.env.REACT_APP_API_KEY    || 'va_kdLkuOCwIC6-tzojkHvoPAqxMFvfsViB2TGBYtQjUGY'; // Grand Clubhouse key
+const UPLOAD_URL = process.env.REACT_APP_UPLOAD_URL || 'http://localhost:5001/upload_document';
 
 // Streaming STT mode - captures raw PCM via ScriptProcessorNode and streams to backend
 const USE_STREAMING_STT = true;
@@ -14,119 +18,133 @@ function AppStreaming() {
   const [selectedVoice, setSelectedVoice] = useState('en-US-Neural2-J');
   const selectedVoiceRef = useRef('en-US-Neural2-J');
   const [isMonitoring, setIsMonitoring] = useState(false);
-  const [mode, setMode] = useState('general');  // 'general' or 'document'
+  const [mode, setMode] = useState('general');  // 'general', 'document', or 'agent'
   const modeRef = useRef('general');
   const [documents, setDocuments] = useState([]);
   const [selectedDocument, setSelectedDocument] = useState('all');
+  const selectedDocumentRef = useRef('all');
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef(null);
   const [conversationHistory, setConversationHistory] = useState([]);
   const chatEndRef = useRef(null);
 
-  const socketRef = useRef(null);
+  const socketRef = useRef(null);  // holds the raw WebSocket
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
+  const micVADRef = useRef(null);
   const streamingRef = useRef(false);
-  const setupInProgressRef = useRef(false);  // prevents concurrent startListening calls
+  const setupInProgressRef = useRef(false);
   const currentAudioRef = useRef(null);
   const audioQueueRef = useRef([]);
-  const audioChunksRef = useRef([]);  // Accumulate audio chunks
+  const audioChunksRef = useRef([]);
   const sessionIdRef = useRef(crypto.randomUUID());
   const isSpeakingRef = useRef(false);
-  const lastEndTimeRef = useRef(0);  // Cooldown to prevent rapid start/stop cycles
-  const currentRequestIdRef = useRef(null);  // Track which request we're waiting for
-  const responseEpochRef = useRef(0);        // Bumped on barge-in — stale word-timing timeouts bail out
+  const lastEndTimeRef = useRef(0);
+  const currentRequestIdRef = useRef(null);
+  const responseEpochRef = useRef(0);
 
+  // ── WebSocket send helper ────────────────────────────────────────
+  const sendMsg = (type, data) => {
+    const ws = socketRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type, data: data || {} }));
+    }
+  };
+
+  // ── WebSocket setup ──────────────────────────────────────────────
   useEffect(() => {
-    // Connect to WebSocket server
-    socketRef.current = io('http://localhost:5000');
+    const ws = new WebSocket(WS_URL);
+    socketRef.current = ws;
 
-    socketRef.current.on('connected', (data) => {
-      console.log(' Connected to server:', data);
+    ws.onopen = () => {
+      console.log('[ws] connected — sending auth');
+      ws.send(JSON.stringify({ type: 'auth', data: { api_key: API_KEY } }));
+    };
 
-      // Start listening on connect
-      startListening();
-    });
+    ws.onmessage = (event) => {
+      const { type, data } = JSON.parse(event.data);
 
-    socketRef.current.on('transcript', (data) => {
-      console.log(' Transcript:', data.text, 'Final:', data.is_final);
-      if (data.is_final) {
-        setResponseText('');  // Clear interim text
+      switch (type) {
+        case 'connected':
+          console.log('[ws] authenticated, session:', data.session_id);
+          startListening();
+          break;
+
+        case 'stream_started':
+          console.log('[ws] STT stream started:', data.session_id);
+          break;
+
+        case 'audio_chunk':
+          if (data.request_id && data.request_id !== currentRequestIdRef.current) {
+            console.log('[ws] ignoring audio chunk from old request:', data.text);
+            return;
+          }
+          console.log('[ws] audio chunk:', data.text, `(queue: ${audioQueueRef.current.length})`);
+          audioQueueRef.current.push(data);
+          isSpeakingRef.current = true;
+          setIsSpeaking(true);
+          if (!currentAudioRef.current) {
+            playNextAudio();
+          }
+          break;
+
+        case 'stream_complete':
+          console.log('[ws] stream complete');
+          if (!currentAudioRef.current && audioQueueRef.current.length === 0) {
+            isSpeakingRef.current = false;
+            setIsSpeaking(false);
+          }
+          setTimeout(() => setResponseText(''), 2000);
+          break;
+
+        case 'documents_list':
+          console.log('[ws] documents:', data.documents);
+          setDocuments(data.documents || []);
+          break;
+
+        case 'conversation_pair':
+          console.log('[ws] conversation pair:', data);
+          setConversationHistory(prev => [...prev, {
+            user: data.user_query,
+            assistant: data.llm_response,
+            timestamp: new Date().toISOString()
+          }]);
+          break;
+
+        case 'error':
+          console.error('[ws] server error:', data.message);
+          break;
+
+        default:
+          break;
       }
-    });
+    };
 
-    socketRef.current.on('audio_chunk', (data) => {
-      // Ignore chunks from old/cancelled requests
-      if (data.request_id && data.request_id !== currentRequestIdRef.current) {
-        console.log(' Ignoring audio chunk from old request:', data.text);
-        return;
-      }
-      console.log(' Received audio chunk:', data.text, `(queue: ${audioQueueRef.current.length})`);
-      audioQueueRef.current.push(data);
-      isSpeakingRef.current = true;
-      setIsSpeaking(true);
-      if (!currentAudioRef.current) {
-        console.log('▶ Starting playback');
-        playNextAudio();
-      }
-    });
+    ws.onclose = (e) => {
+      console.log('[ws] closed:', e.code, e.reason);
+    };
 
-    socketRef.current.on('stream_complete', () => {
-      console.log(' Stream complete');
-      // Only mark done if no audio is still playing — otherwise playNextAudio handles it on last onended
-      if (!currentAudioRef.current && audioQueueRef.current.length === 0) {
-        isSpeakingRef.current = false;
-        setIsSpeaking(false);
-      }
-      // Clear response text for next interaction after a delay
-      setTimeout(() => {
-        setResponseText('');
-      }, 2000);
-    });
-
-    socketRef.current.on('stream_started', (data) => {
-      console.log(' Streaming STT started:', data.session_id);
-    });
-
-    socketRef.current.on('error', (data) => {
-      console.error(' Server error:', data.message);
-    });
-
-    socketRef.current.on('documents_list', (data) => {
-      console.log('📄 Received documents list:', data.documents);
-      console.log('📄 Number of documents:', data.documents?.length || 0);
-      if (data.documents && data.documents.length > 0) {
-        console.log('📄 Documents:', data.documents);
-      } else {
-        console.warn('⚠️ No documents received or empty list');
-      }
-      setDocuments(data.documents || []);
-    });
-
-    socketRef.current.on('conversation_pair', (data) => {
-      console.log('💬 Received conversation pair:', data);
-      setConversationHistory(prev => [...prev, {
-        user: data.user_query,
-        assistant: data.llm_response,
-        timestamp: new Date().toISOString()
-      }]);
-    });
+    ws.onerror = (e) => {
+      console.error('[ws] error:', e);
+    };
 
     return () => {
-      socketRef.current?.disconnect();
+      ws.close();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Fetch documents when entering document mode
   useEffect(() => {
-    if (mode === 'document' && socketRef.current) {
-      console.log('📄 Requesting documents list');
-      socketRef.current.emit('get_documents');
+    if (mode === 'document') {
+      console.log('[ws] requesting documents list');
+      sendMsg('get_documents', {});
     } else if (mode === 'general') {
-      // Clear conversation history when switching to general mode
+      setConversationHistory([]);
+    } else if (mode === 'agent') {
       setConversationHistory([]);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
   // Auto-scroll to bottom when new messages arrive
@@ -138,38 +156,33 @@ function AppStreaming() {
 
   const playNextAudio = async () => {
     if (currentAudioRef.current || audioQueueRef.current.length === 0) {
-      console.log(`⏸ Playback blocked - current: ${!!currentAudioRef.current}, queue: ${audioQueueRef.current.length}`);
       return;
     }
 
     const { audio, text, words } = audioQueueRef.current.shift();
-    console.log(`▶ Playing audio: "${text}"`);
+    console.log(`[audio] playing: "${text}"`);
 
     return new Promise((resolve) => {
       const audioElement = new Audio(`data:audio/mp3;base64,${audio}`);
       currentAudioRef.current = audioElement;
 
       audioElement.onloadedmetadata = () => {
-        console.log(` Audio loaded, duration: ${audioElement.duration}s`);
         const epochAtStart = responseEpochRef.current;
-        // Reset to show only the current sentence (not a growing paragraph)
         setResponseText(text.split(/\s+/)[0] || '');
-        words.forEach((wordData, idx) => {
-          if (idx === 0) return; // first word already set above
+        (words || []).forEach((wordData, idx) => {
+          if (idx === 0) return;
           const delayMs = wordData.time_seconds * 1000;
           setTimeout(() => {
-            if (responseEpochRef.current !== epochAtStart) return; // barge-in happened
-            setResponseText(words.slice(0, idx + 1).map(w => w.word).join(' '));
+            if (responseEpochRef.current !== epochAtStart) return;
+            setResponseText((words || []).slice(0, idx + 1).map(w => w.word).join(' '));
           }, delayMs);
         });
       };
 
       audioElement.onended = () => {
-        console.log(' Audio playback ended');
         currentAudioRef.current = null;
         resolve();
         playNextAudio();
-        // If nothing new started, this was the last chunk
         if (!currentAudioRef.current) {
           isSpeakingRef.current = false;
           setIsSpeaking(false);
@@ -178,9 +191,8 @@ function AppStreaming() {
       };
 
       if (!isMuted) {
-        console.log(' Starting audio.play()');
         audioElement.play().catch(e => {
-          console.error(' Audio play failed:', e);
+          console.error('[audio] play failed:', e);
           currentAudioRef.current = null;
           resolve();
           playNextAudio();
@@ -190,7 +202,6 @@ function AppStreaming() {
           }
         });
       } else {
-        console.log(' Muted - skipping audio');
         setResponseText(prev => prev + (prev ? ' ' : '') + text);
         currentAudioRef.current = null;
         resolve();
@@ -203,123 +214,11 @@ function AppStreaming() {
     });
   };
 
-  const monitorAudioLevel = () => {
-    if (!analyserRef.current) return;
-
-    const bufferLength = analyserRef.current.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    const SILENCE_THRESHOLD = 0.4;   // For detecting silence
-    const SPEECH_THRESHOLD = 2.5;    // Higher threshold to avoid false triggers from breathing
-    const SILENCE_DURATION_MS = 1000; // Stop after 300ms of sustained silence
-    let lastLogTime = 0;
-    let silenceStartTime = null;
-
-    const checkAudioLevel = () => {
-      if (!analyserRef.current) return;
-
-      analyserRef.current.getByteTimeDomainData(dataArray);
-
-      let sum = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        sum += Math.abs(dataArray[i] - 128);
-      }
-      const average = sum / bufferLength;
-
-      // Log audio level every 2 seconds for debugging
-      const now = Date.now();
-      if (now - lastLogTime > 2000) {
-        console.log(` Audio level: ${average.toFixed(2)} (threshold: ${SPEECH_THRESHOLD}, streaming: ${streamingRef.current})`);
-        lastLogTime = now;
-      }
-
-      if (average > SPEECH_THRESHOLD) {
-        // Reset silence timer
-        silenceStartTime = null;
-
-        // Check cooldown period (500ms after last end)
-        const timeSinceLastEnd = now - lastEndTimeRef.current;
-        const COOLDOWN_MS = 500;
-
-        if (!streamingRef.current && timeSinceLastEnd > COOLDOWN_MS) {
-          // Barge-in: stop AI speech if it's playing
-          if (isSpeakingRef.current) {
-            console.log(' Barge-in detected - stopping AI speech');
-            currentRequestIdRef.current = null;  // Invalidate — drops any in-flight chunks
-            responseEpochRef.current += 1;       // Kill pending word-timing timeouts
-            if (currentAudioRef.current) {
-              currentAudioRef.current.pause();
-              currentAudioRef.current = null;
-            }
-            audioQueueRef.current = [];
-            isSpeakingRef.current = false;
-            setIsSpeaking(false);
-            // Notify backend to cancel current pipeline
-            socketRef.current.emit('barge_in', { session_id: sessionIdRef.current });
-          }
-          setResponseText('');
-
-          // User started speaking - start fresh recording
-          console.log(' Speech detected - starting new recording');
-          setIsListening(true);
-          streamingRef.current = true;
-          audioChunksRef.current = [];  // Clear any old chunks
-
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
-            if (USE_STREAMING_STT) {
-              // Streaming mode: open backend STT stream, PCM flows via ScriptProcessorNode
-              socketRef.current.emit('start_stream', {
-                session_id: sessionIdRef.current,
-                voice: selectedVoiceRef.current,
-                mimeType: 'audio/pcm',  // signals LINEAR16 @ 48kHz
-                mode: modeRef.current,   // 'general' or 'document'
-                selectedDocument: selectedDocument  // selected document for filtering
-              });
-              mediaRecorderRef.current.start();  // no timeslice — blob kept for fallback only
-              console.log(' Streaming recording started (PCM via ScriptProcessor)');
-            } else {
-              // Batch mode: single blob on stop
-              mediaRecorderRef.current.start();
-              console.log(' Recording started (batch mode)');
-            }
-          }
-        }
-      } else if (average <= SPEECH_THRESHOLD && streamingRef.current) {
-        // Track silence duration
-        if (!silenceStartTime) {
-          silenceStartTime = now;
-          console.log(' Silence detected - waiting...');
-        } else if (now - silenceStartTime > SILENCE_DURATION_MS) {
-          // Sustained silence - stop recording
-          console.log(' Stopping recording after sustained silence');
-          setIsListening(false);
-          streamingRef.current = false;
-          lastEndTimeRef.current = now;  // Set cooldown timestamp
-
-          // Stop MediaRecorder - produces single complete blob with proper header
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            mediaRecorderRef.current.stop();
-          }
-
-          silenceStartTime = null;
-        }
-      }
-
-      requestAnimationFrame(checkAudioLevel);
-    };
-
-    checkAudioLevel();
-  };
-
   const startListening = async () => {
-    // Guard: if a previous call is still awaiting getUserMedia, skip.
-    // Without this, rapid 'connected' events each launch getUserMedia concurrently;
-    // both see audioContextRef as null, both create a ScriptProcessorNode → 2x PCM.
     if (setupInProgressRef.current) return;
     setupInProgressRef.current = true;
 
     try {
-      // Tear down any previous audio pipeline — each call creates a new AudioContext +
-      // ScriptProcessorNode, so stale ones must be closed or they keep sending PCM.
       if (audioContextRef.current) {
         audioContextRef.current.close();
         audioContextRef.current = null;
@@ -335,97 +234,61 @@ function AppStreaming() {
         }
       });
 
-      // AudioContext for level monitoring + PCM capture — lock to 48kHz to match Google STT config
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      analyserRef.current.fftSize = 2048;
       const source = audioContextRef.current.createMediaStreamSource(stream);
-      source.connect(analyserRef.current);
 
-      // ScriptProcessorNode captures raw PCM for streaming STT
+      // ScriptProcessorNode for PCM streaming to Go STT
       const scriptProcessor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
       scriptProcessor.onaudioprocess = (event) => {
-        event.outputBuffer.getChannelData(0).fill(0); // silence output — no mic loopback
+        event.outputBuffer.getChannelData(0).fill(0);
         if (!streamingRef.current || !socketRef.current) return;
 
-        // Float32 → Int16 (LINEAR16)
         const input = event.inputBuffer.getChannelData(0);
         const int16 = new Int16Array(input.length);
         for (let i = 0; i < input.length; i++) {
           int16[i] = Math.max(-32768, Math.min(32767, input[i] * 32767 | 0));
         }
-        // Int16 buffer → base64
         const bytes = new Uint8Array(int16.buffer);
         let binary = '';
         for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        socketRef.current.emit('stt_audio', { audio: btoa(binary) });
+        sendMsg('stt_audio', { audio: btoa(binary) });
       };
       source.connect(scriptProcessor);
       scriptProcessor.connect(audioContextRef.current.destination);
 
-      // Try formats in order of reliability (OGG is more reliable than WebM)
       let mimeType = '';
-      const formats = [
-        'audio/ogg;codecs=opus',  // Most reliable
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        ''  // Browser default
-      ];
-
+      const formats = ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus', 'audio/webm', ''];
       for (const format of formats) {
         if (format === '' || MediaRecorder.isTypeSupported(format)) {
           mimeType = format;
-          console.log(` Using MIME type: ${mimeType || 'browser default'}`);
           break;
-        } else {
-          console.warn(` ${format} not supported, trying next...`);
         }
       }
 
-      mediaRecorderRef.current = new MediaRecorder(stream,
-        mimeType ? { mimeType } : undefined
-      );
+      mediaRecorderRef.current = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      selectedVoiceRef.current = selectedVoice;
+      window.currentAudioMimeType = mediaRecorderRef.current.mimeType;
 
-      // Store the actual MIME type being used
-      selectedVoiceRef.current = selectedVoice; // Also update voice ref
-      const actualMimeType = mediaRecorderRef.current.mimeType;
-      console.log(` MediaRecorder created with MIME type: ${actualMimeType}`);
-
-      // Store MIME type for sending to backend
-      window.currentAudioMimeType = actualMimeType;
-
-      // Accumulate MediaRecorder chunks (fallback blob in streaming mode, primary in batch)
       mediaRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
       };
 
-      // When MediaRecorder stops
       mediaRecorderRef.current.onstop = async () => {
-        console.log(' MediaRecorder stopped');
-
-        // New request — stamp an ID so we can drop stale chunks from a previous one
         const requestId = crypto.randomUUID();
         currentRequestIdRef.current = requestId;
 
         if (USE_STREAMING_STT) {
-          // Streaming mode: signal end of speech
-          console.log(' Sending end_speech signal');
-          socketRef.current.emit('end_speech', { session_id: sessionIdRef.current, request_id: requestId });
+          console.log('[ws] sending end_speech');
+          sendMsg('end_speech', { session_id: sessionIdRef.current, request_id: requestId });
         } else {
-          // Batch mode: send complete audio blob
-          if (audioChunksRef.current.length > 0 && socketRef.current) {
+          if (audioChunksRef.current.length > 0) {
             const actualType = window.currentAudioMimeType || 'audio/webm;codecs=opus';
             const audioBlob = new Blob(audioChunksRef.current, { type: actualType });
-            console.log(` Sending audio: ${audioBlob.size} bytes (${audioChunksRef.current.length} chunks) - Type: ${actualType}`);
-
             const reader = new FileReader();
             reader.onloadend = () => {
-              const base64Audio = reader.result;
-              socketRef.current.emit('audio_complete', {
+              sendMsg('audio_complete', {
                 session_id: sessionIdRef.current,
-                audio: base64Audio,
+                audio: reader.result,
                 voice: selectedVoiceRef.current,
                 mimeType: window.currentAudioMimeType || 'audio/webm;codecs=opus',
                 request_id: requestId
@@ -437,14 +300,72 @@ function AppStreaming() {
         audioChunksRef.current = [];
       };
 
-      // Don't start recording yet - wait for speech detection
       setIsMonitoring(true);
-      console.log(' Audio monitoring started (webm/opus) - waiting for speech...');
 
-      monitorAudioLevel();
+      micVADRef.current = await MicVAD.new({
+        stream,
+        workletURL: '/vad.worklet.bundle.min.js',
+        modelURL: '/silero_vad_v5.onnx',
+        positiveSpeechThreshold: 0.5,
+        negativeSpeechThreshold: 0.35,
+        minSpeechFrames: 3,
+        redemptionFrames: 8,
+        onSpeechStart: () => {
+          const now = Date.now();
+          const timeSinceLastEnd = now - lastEndTimeRef.current;
+          const COOLDOWN_MS = 500;
+
+          if (!streamingRef.current && timeSinceLastEnd > COOLDOWN_MS) {
+            if (isSpeakingRef.current) {
+              console.log('[vad] barge-in — stopping AI speech');
+              currentRequestIdRef.current = null;
+              responseEpochRef.current += 1;
+              if (currentAudioRef.current) {
+                currentAudioRef.current.pause();
+                currentAudioRef.current = null;
+              }
+              audioQueueRef.current = [];
+              isSpeakingRef.current = false;
+              setIsSpeaking(false);
+              sendMsg('barge_in', { session_id: sessionIdRef.current });
+            }
+            setResponseText('');
+            console.log('[vad] speech detected — starting recording');
+            setIsListening(true);
+            streamingRef.current = true;
+            audioChunksRef.current = [];
+
+            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
+              if (USE_STREAMING_STT) {
+                sendMsg('start_stream', {
+                  voice: selectedVoiceRef.current,
+                  mode: modeRef.current,
+                  selected_document: selectedDocumentRef.current
+                });
+                mediaRecorderRef.current.start();
+              } else {
+                mediaRecorderRef.current.start();
+              }
+            }
+          }
+        },
+        onSpeechEnd: () => {
+          if (streamingRef.current) {
+            console.log('[vad] speech ended — stopping recording');
+            setIsListening(false);
+            streamingRef.current = false;
+            lastEndTimeRef.current = Date.now();
+            if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+              mediaRecorderRef.current.stop();
+            }
+          }
+        },
+      });
+      micVADRef.current.start();
+      console.log('[vad] Silero VAD initialized and listening');
 
     } catch (error) {
-      console.error('Error accessing microphone:', error);
+      console.error('[audio] error accessing microphone:', error);
     } finally {
       setupInProgressRef.current = false;
     }
@@ -459,21 +380,19 @@ function AppStreaming() {
   };
 
   const endSession = () => {
-    if (streamingRef.current) {
-      socketRef.current.emit('stop_stream');
-      streamingRef.current = false;
-    }
-
+    streamingRef.current = false;
     if (mediaRecorderRef.current) {
       mediaRecorderRef.current.stop();
       mediaRecorderRef.current = null;
     }
-
+    if (micVADRef.current) {
+      micVADRef.current.destroy();
+      micVADRef.current = null;
+    }
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
-
     setIsListening(false);
     setIsSpeaking(false);
     setIsMonitoring(false);
@@ -490,13 +409,13 @@ function AppStreaming() {
     }
 
     setIsUploading(true);
-    console.log('📄 Uploading document:', file.name);
+    console.log('[upload] uploading:', file.name);
 
     const formData = new FormData();
     formData.append('file', file);
 
     try {
-      const response = await fetch('http://localhost:5000/upload_document', {
+      const response = await fetch(UPLOAD_URL, {
         method: 'POST',
         body: formData,
       });
@@ -504,51 +423,49 @@ function AppStreaming() {
       const result = await response.json();
 
       if (result.success) {
-        console.log('✅ Upload successful:', result.message);
-        // Refresh documents list
-        socketRef.current.emit('get_documents');
-        // Auto-select the newly uploaded document
+        console.log('[upload] success:', result.message);
+        sendMsg('get_documents', {});
         setSelectedDocument(result.filename);
+        selectedDocumentRef.current = result.filename;
         alert(`Successfully uploaded: ${result.filename}`);
       } else {
-        console.error('❌ Upload failed:', result.message);
+        console.error('[upload] failed:', result.message);
         alert(`Upload failed: ${result.message}`);
       }
     } catch (error) {
-      console.error('❌ Upload error:', error);
+      console.error('[upload] error:', error);
       alert(`Upload error: ${error.message}`);
     } finally {
       setIsUploading(false);
-      // Reset file input
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
   return (
     <div className="App">
-      {mode === 'document' ? (
+      {true ? (
         <div className="chat-container">
           <div className="chat-history">
             {conversationHistory.length === 0 ? (
               <div className="chat-empty">
                 <i className="fas fa-comments"></i>
-                <p>Start a conversation by asking a question about your documents</p>
+                <p>
+                  {mode === 'document'
+                    ? 'Start a conversation by asking a question about your documents'
+                    : mode === 'agent'
+                    ? 'Ask questions about facilities, bookings, classes, and memberships'
+                    : 'Start a conversation'}
+                </p>
               </div>
             ) : (
               conversationHistory.map((msg, index) => (
                 <div key={index} className="chat-message-group">
                   <div className="chat-message user-message">
-                    <div className="message-icon">
-                      <i className="fas fa-user"></i>
-                    </div>
+                    <div className="message-icon"><i className="fas fa-user"></i></div>
                     <div className="message-content">{msg.user}</div>
                   </div>
                   <div className="chat-message assistant-message">
-                    <div className="message-icon">
-                      <i className="fas fa-robot"></i>
-                    </div>
+                    <div className="message-icon"><i className="fas fa-robot"></i></div>
                     <div className="message-content">{msg.assistant}</div>
                   </div>
                 </div>
@@ -559,9 +476,7 @@ function AppStreaming() {
         </div>
       ) : (
         <div className="message-area">
-          {responseText && (
-            <div className="response-text">{responseText}</div>
-          )}
+          {responseText && <div className="response-text">{responseText}</div>}
         </div>
       )}
 
@@ -578,29 +493,35 @@ function AppStreaming() {
       <div className="status-text">
         {isListening && 'Listening...'}
         {isSpeaking && 'Speaking...'}
-        {!isListening && !isSpeaking && isMonitoring && `Ready — ${mode === 'document' ? 'Document Mode' : 'General Mode'}`}
+        {!isListening && !isSpeaking && isMonitoring && `Ready — ${
+          mode === 'document' ? 'Document Mode' :
+          mode === 'agent' ? 'Database Agent' :
+          'General Mode'
+        }`}
         {!isListening && !isSpeaking && !isMonitoring && 'Connecting...'}
       </div>
 
       <div className="controls">
-        <button
-          className="control-btn exit"
-          onClick={endSession}
-          title="End session"
-        >
+        <button className="control-btn exit" onClick={endSession} title="End session">
           <i className="fas fa-times"></i>
         </button>
         <button
-          className={`control-btn mode-toggle ${mode === 'document' ? 'active' : ''}`}
+          className={`control-btn mode-toggle ${mode !== 'general' ? 'active' : ''}`}
           onClick={() => {
-            const newMode = mode === 'general' ? 'document' : 'general';
+            let newMode;
+            if (mode === 'general') newMode = 'document';
+            else if (mode === 'document') newMode = 'agent';
+            else newMode = 'general';
             setMode(newMode);
             modeRef.current = newMode;
-            console.log(' Mode changed to:', newMode);
           }}
-          title={mode === 'general' ? 'Switch to Document Mode' : 'Switch to General Mode'}
+          title={`Current: ${mode.charAt(0).toUpperCase() + mode.slice(1)} Mode (Click to switch)`}
         >
-          <i className={`fas ${mode === 'general' ? 'fa-comment' : 'fa-file-alt'}`}></i>
+          <i className={`fas ${
+            mode === 'general' ? 'fa-comment' :
+            mode === 'document' ? 'fa-file-alt' :
+            'fa-database'
+          }`}></i>
         </button>
         <button
           className={`control-btn mute ${isMuted ? 'active' : ''}`}
@@ -617,10 +538,8 @@ function AppStreaming() {
           id="voice"
           value={selectedVoice}
           onChange={(e) => {
-            const newVoice = e.target.value;
-            setSelectedVoice(newVoice);
-            selectedVoiceRef.current = newVoice;
-            console.log(' Voice changed to:', newVoice);
+            setSelectedVoice(e.target.value);
+            selectedVoiceRef.current = e.target.value;
           }}
         >
           <option value="en-US-Neural2-A">Male 1 (Warm)</option>
@@ -642,17 +561,14 @@ function AppStreaming() {
             id="document"
             value={selectedDocument}
             onChange={(e) => {
-              const newDocument = e.target.value;
-              setSelectedDocument(newDocument);
-              console.log('📄 Document changed to:', newDocument);
+              setSelectedDocument(e.target.value);
+              selectedDocumentRef.current = e.target.value;
             }}
             disabled={isUploading}
           >
             <option value="all">All Documents</option>
             {documents.map((doc) => (
-              <option key={doc} value={doc}>
-                {doc}
-              </option>
+              <option key={doc} value={doc}>{doc}</option>
             ))}
           </select>
           <input
