@@ -1,4 +1,4 @@
-"""SQLite Query Agent — multi-tenant, generic: queries any SQLite database."""
+"""SQLite Query Agent — agentic: Gemini function calling + ReAct loop."""
 import json
 import time
 import sqlite3
@@ -8,50 +8,37 @@ from google.genai import types
 from config import GEMINI_API_KEY
 
 _gemini      = genai.Client(api_key=GEMINI_API_KEY)
-_SCHEMA_TTL  = 300  # seconds — schema rebuilt at most every 5 minutes
-_schema_store: dict = {}  # db_path → {"schema": str, "ts": float}
+_SCHEMA_TTL  = 300
+_schema_store: dict = {}
+MAX_LOOP     = 10
 
 
 class SQLiteAgent:
-    """
-    Multi-tenant voice agent that queries ANY SQLite database.
-
-    Drop-in replacement for MongoDBAgent when db_config['type'] == 'sqlite'.
-    db_config must contain:
-        db_path            — absolute path to the .sqlite / .db file on the server
-        schema_description — optional plain-English hint about the data and write operations
-    """
 
     def __init__(self, db_config: dict):
         self.gemini      = _gemini
         self.db_path     = db_config["db_path"]
         self.schema_desc = db_config.get("schema_description", "")
-
         if not __import__("os").path.exists(self.db_path):
             raise FileNotFoundError(f"SQLite database not found: {self.db_path}")
+        self._tools        = self._build_tools()
+        self._next_pending = None
 
-    # ── Helpers ────────────────────────────────────────────────────────
+    # ── Schema ──────────────────────────────────────────────────────────
 
     def _schema(self) -> str:
-        """Return schema string, rebuilding from the DB at most every _SCHEMA_TTL seconds.
-
-        Stored in module-level _schema_store keyed by db_path so it survives
-        agent re-instantiation (fresh agent per request, no connection issues).
-        """
         entry = _schema_store.get(self.db_path)
         if entry and (time.time() - entry["ts"]) < _SCHEMA_TTL:
             return entry["schema"]
-
         conn = sqlite3.connect(self.db_path)
         try:
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
             tables = [row[0] for row in cur.fetchall()]
-
-            parts = []
+            parts  = []
             for table in tables:
                 cur.execute(f"PRAGMA table_info({table})")
-                cols      = cur.fetchall()   # (cid, name, type, notnull, default, pk)
+                cols      = cur.fetchall()
                 col_str   = ", ".join(f"{c[1]} {c[2]}" for c in cols)
                 name_cols = [c[1] for c in cols if "name" in c[1].lower() or c[1] == "title"]
                 vals = []
@@ -64,200 +51,401 @@ class SQLiteAgent:
                 parts.append(line)
         finally:
             conn.close()
-
         base   = "Tables:\n" + "\n".join(parts)
         schema = f"{self.schema_desc}\n\n{base}" if self.schema_desc else base
         _schema_store[self.db_path] = {"schema": schema, "ts": time.time()}
         return schema
 
-    def _llm(self, prompt: str, temperature: float = 0.7, json_mode: bool = False) -> str:
-        """Single Gemini call used by all methods."""
-        cfg = types.GenerateContentConfig(
-            temperature=temperature,
-            response_mime_type="application/json" if json_mode else "text/plain",
-        )
-        return self.gemini.models.generate_content(
-            model="gemini-2.5-flash-lite", contents=prompt, config=cfg
-        ).text.strip()
+    def _invalidate_schema(self):
+        _schema_store.pop(self.db_path, None)
 
-    # ── Planning ───────────────────────────────────────────────────────
+    # ── Tool definitions ────────────────────────────────────────────────
 
-    def _plan(self, user_query: str, history: list = None, pending: dict = None) -> dict:
-        """Gemini call #1: natural language → structured operation plan (JSON)."""
-        today = datetime.now().strftime("%Y-%m-%d")
+    def _build_tools(self) -> types.Tool:
+        return types.Tool(function_declarations=[
+            types.FunctionDeclaration(
+                name="query_table",
+                description=(
+                    "Run a SQLite SELECT query. Use for questions, lookups, listings, and counts. "
+                    "If 0 rows returned, retry with a broader LIKE filter before reporting nothing found. "
+                    "Always LIMIT 20 unless counting."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "sql": types.Schema(type=types.Type.STRING,
+                                            description="Valid SQLite SELECT statement"),
+                    },
+                    required=["sql"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="confirm_action",
+                description=(
+                    "REQUIRED before any insert_row, update_row, or delete_row call. "
+                    "Presents the full action details to the user for confirmation. "
+                    "Do NOT call any write tool in the same turn — wait for the user's reply."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "summary":      types.Schema(type=types.Type.STRING,
+                                                     description="Natural-language summary of what will happen"),
+                        "action_type":  types.Schema(type=types.Type.STRING,
+                                                     description="insert | update | delete"),
+                        "table":        types.Schema(type=types.Type.STRING),
+                        "values":       types.Schema(type=types.Type.OBJECT,
+                                                     description="Row values to insert (action_type=insert)"),
+                        "where_sql":    types.Schema(type=types.Type.STRING,
+                                                     description="WHERE clause for update/delete (without the WHERE keyword)"),
+                        "update_set":   types.Schema(type=types.Type.OBJECT,
+                                                     description="Column→value mapping to set (action_type=update)"),
+                    },
+                    required=["summary", "action_type", "table"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="insert_row",
+                description=(
+                    "Insert a new row. Call ONLY after confirm_action was accepted by the user. "
+                    "NEVER include system fields: *_id, status, created_at, source, price/fee/amount."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "table":  types.Schema(type=types.Type.STRING),
+                        "values": types.Schema(type=types.Type.OBJECT,
+                                               description="Column→value mapping (user-facing fields only)"),
+                    },
+                    required=["table", "values"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="update_row",
+                description=(
+                    "Update an existing row. Call ONLY after confirm_action was accepted. "
+                    "Requires a WHERE clause."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "table":      types.Schema(type=types.Type.STRING),
+                        "where_sql":  types.Schema(type=types.Type.STRING,
+                                                   description="WHERE clause without the WHERE keyword, e.g. \"member_name='Charlotte' AND date='2026-02-25'\""),
+                        "update_set": types.Schema(type=types.Type.OBJECT,
+                                                   description="Column→value mapping of fields to change"),
+                    },
+                    required=["table", "where_sql", "update_set"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="delete_row",
+                description=(
+                    "Delete a row. Call ONLY after confirm_action was accepted. "
+                    "Requires a WHERE clause — will never delete all rows."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "table":     types.Schema(type=types.Type.STRING),
+                        "where_sql": types.Schema(type=types.Type.STRING,
+                                                  description="WHERE clause without the WHERE keyword"),
+                    },
+                    required=["table", "where_sql"],
+                ),
+            ),
+            types.FunctionDeclaration(
+                name="ask_user",
+                description=(
+                    "Ask the user for missing information (missing field, ambiguous name). "
+                    "Do NOT use this for confirmation — use confirm_action instead."
+                ),
+                parameters=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "question":       types.Schema(type=types.Type.STRING),
+                        "table":          types.Schema(type=types.Type.STRING,
+                                                       description="Target table if an insert is in progress"),
+                        "partial_values": types.Schema(type=types.Type.OBJECT,
+                                                       description="Column values collected so far"),
+                    },
+                    required=["question"],
+                ),
+            ),
+        ])
 
-        pending_block = ""
-        if pending:
-            table = pending.get("table", "")
-            lines = [
-                f'  {k} = "{v}"' if v else f'  {k} = (MISSING — extract from message)'
-                for k, v in pending.get("insert_values", {}).items()
-            ]
-            pending_block = (
-                f"\nINSERT IN PROGRESS — return operation_type=\"insert\", insert_table=\"{table}\".\n"
-                f"Known fields:\n" + "\n".join(lines) + "\n"
-                "Fill MISSING fields from the message. Keep known fields unchanged.\n"
-            )
+    # ── Tool execution ──────────────────────────────────────────────────
 
-        history_block = ""
-        if history and not pending:
-            lines = [
-                f"User: {t.get('user', '')}\nAssistant: {t.get('assistant', '')}"
-                for t in history[-4:]
-            ]
-            history_block = "\nCONVERSATION HISTORY:\n" + "\n".join(lines) + "\n"
-
-        prompt = f"""You are a SQLite database assistant for {self.schema_desc or "a business"}.
-
-SCHEMA:
-{self._schema()}
-
-TODAY: {today}
-{history_block}
-Use EXACT values from the schema. USER QUERY: "{user_query}"
-{pending_block}
-Return JSON:
-{{
-  "intent": "",
-  "operation_type": "read",
-  "sql": "SELECT ...",
-  "insert_table": "",
-  "insert_values": {{}},
-  "ready_to_insert": false,
-  "ask_user": ""
-}}
-
-operation_type "read" = questions/lookups/listing. "insert" = adding/creating/booking/ordering.
-
-READ: write valid SQLite SELECT SQL. Use LIKE '%x%' for text search. Always LIMIT 20. Set sql, leave insert_* empty.
-
-INSERT rules:
-- Only collect fields the user would naturally know: names, dates, times, quantities, descriptions.
-- NEVER include system fields in insert_values — identify them by these patterns:
-    * Any field whose name ends with "_id" — these are system-generated keys
-    * Any field named: status, source, created_at, updated_at, created, updated — set by the system
-    * Any monetary field: amount, price, cost, rate, fee, total — looked up or calculated by the system
-- If a person's name was provided but does NOT clearly match any name in the schema values, set ready_to_insert=false and ask_user="Did you mean [closest match]? Please confirm the name."
-- Set ready_to_insert=true only when all USER-FACING required fields have values.
-- If any user-facing field is missing, set ready_to_insert=false and write a short, friendly ask_user.
-- Dates → YYYY-MM-DD (today={today}). Leave sql empty for inserts."""
-
-        try:
-            return json.loads(self._llm(prompt, temperature=0.1, json_mode=True))
-        except Exception as e:
-            print(f"[SQLiteAgent] Plan error: {e}")
-            return {"intent": "error", "operation_type": "read", "sql": None}
-
-    # ── Execution ──────────────────────────────────────────────────────
-
-    def _execute(self, plan: dict):
-        """Execute a read query or parameterized insert depending on operation_type."""
-        op = plan.get("operation_type", "read")
-
-        if op == "insert":
-            table  = plan.get("insert_table", "")
-            values = plan.get("insert_values", {})
-            if not table or not values:
-                return {"success": False, "error": "Missing table or values for insert"}
-            values.setdefault("status",     "confirmed")
-            values.setdefault("created_at", datetime.now().isoformat())
-            values.setdefault("source",     "voice")
-            cols        = ", ".join(values.keys())
-            placeholders = ", ".join("?" * len(values))
-            sql  = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute(sql, list(values.values()))
-                conn.commit()
-                return {"success": True, "table": table, "document": values}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
-            finally:
-                conn.close()
-
-        # READ
-        sql = plan.get("sql")
-        if not sql:
-            return []
+    def _do_query(self, args: dict) -> dict:
+        sql = args.get("sql", "").strip()
+        if not sql.upper().startswith("SELECT"):
+            return {"error": "Only SELECT statements are allowed via query_table."}
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(sql).fetchall()
-            return [dict(row) for row in rows]
+            rows    = conn.execute(sql).fetchall()
+            results = [dict(row) for row in rows]
+            return {"count": len(results), "results": results}
         except Exception as e:
-            print(f"[SQLiteAgent] Query error: {e} | SQL: {sql}")
-            return []
+            return {"error": str(e)}
         finally:
             conn.close()
 
-    # ── Formatting ─────────────────────────────────────────────────────
-
-    def _speak(self, context: str) -> str:
-        """Gemini call #2: turn any data context into a natural spoken response."""
+    def _do_insert(self, args: dict) -> dict:
+        table  = args.get("table", "")
+        values = dict(args.get("values") or {})
+        if not table or not values:
+            return {"error": "Missing table or values for insert."}
+        values.setdefault("status",     "confirmed")
+        values.setdefault("created_at", datetime.now().isoformat())
+        values.setdefault("source",     "voice")
+        cols         = ", ".join(values.keys())
+        placeholders = ", ".join("?" * len(values))
+        sql  = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+        conn = sqlite3.connect(self.db_path)
         try:
-            return self._llm(f"Generate a natural, concise voice response. No markdown.\n\n{context}")
-        except Exception:
-            return "Done."
+            conn.execute(sql, list(values.values()))
+            conn.commit()
+            self._invalidate_schema()
+            return {"success": True, "table": table, "document": values}
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            conn.close()
 
-    # ── Entry point ────────────────────────────────────────────────────
+    def _do_update(self, args: dict) -> dict:
+        table      = args.get("table", "")
+        where_sql  = args.get("where_sql", "").strip()
+        update_set = dict(args.get("update_set") or {})
+        if not table or not where_sql or not update_set:
+            return {"error": "Missing table, where_sql, or update_set for update."}
+        set_clause = ", ".join(f"{col} = ?" for col in update_set)
+        sql  = f"UPDATE {table} SET {set_clause} WHERE {where_sql}"
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute(sql, list(update_set.values()))
+            conn.commit()
+            self._invalidate_schema()
+            return {"success": cur.rowcount > 0, "rows_updated": cur.rowcount, "table": table}
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            conn.close()
+
+    def _do_delete(self, args: dict) -> dict:
+        table     = args.get("table", "")
+        where_sql = args.get("where_sql", "").strip()
+        if not table or not where_sql:
+            return {"error": "Missing table or where_sql for delete."}
+        sql  = f"DELETE FROM {table} WHERE {where_sql}"
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute(sql)
+            conn.commit()
+            self._invalidate_schema()
+            return {"success": cur.rowcount > 0, "rows_deleted": cur.rowcount, "table": table}
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _build_confirm_summary(action_type: str, table: str,
+                                values: dict, where_sql: str, update_set: dict) -> str:
+        """Fallback summary when Gemini omits the summary arg."""
+        col = table.rstrip("s")
+
+        if action_type == "update":
+            new_vals = ", ".join(f"{k} to {v}" for k, v in (update_set or {}).items())
+            parts = [f"Update {col}"]
+            if where_sql: parts.append(f"where {where_sql}")
+            if new_vals:  parts.append(f"— changing {new_vals}")
+            return " ".join(parts) + ". Shall I go ahead?"
+
+        if action_type == "delete":
+            parts = [f"Delete {col}"]
+            if where_sql: parts.append(f"where {where_sql}")
+            return " ".join(parts) + ". Shall I proceed?"
+
+        if action_type == "insert":
+            name = (values or {}).get("member_name") or (values or {}).get("name", "")
+            parts = [f"Add new {col}{' for ' + name if name else ''}"]
+            return " ".join(parts) + ". Shall I proceed?"
+
+        return f"Perform {action_type} on {table}. Shall I proceed?"
+
+    def _run_tool(self, name: str, args: dict) -> dict:
+        if name == "query_table":   return self._do_query(args)
+        if name == "insert_row":    return self._do_insert(args)
+        if name == "update_row":    return self._do_update(args)
+        if name == "delete_row":    return self._do_delete(args)
+        if name == "confirm_action":
+            summary = (args.get("summary") or "").strip()
+            if not summary:
+                summary = self._build_confirm_summary(
+                    args.get("action_type", ""),
+                    args.get("table", ""),
+                    args.get("values") or {},
+                    args.get("where_sql", ""),
+                    args.get("update_set") or {},
+                )
+            return {
+                "__confirm__": summary,
+                "action_type": args.get("action_type", ""),
+                "table":       args.get("table", ""),
+                "values":      args.get("values") or {},
+                "where_sql":   args.get("where_sql", ""),
+                "update_set":  args.get("update_set") or {},
+            }
+        if name == "ask_user":
+            return {
+                "__ask_user__":  args.get("question", ""),
+                "table":         args.get("table", ""),
+                "partial_values": args.get("partial_values") or {},
+            }
+        return {"error": f"Unknown tool '{name}'"}
+
+    # ── Entry point ─────────────────────────────────────────────────────
 
     def query(self, user_query: str, history: list = None, pending: dict = None) -> str:
-        """Natural language in → natural language out.
-
-        Sets self._next_pending:
-          None → no insert in progress.
-          dict → partial insert to carry into the next turn.
-        """
         self._next_pending = None
-        print(f"\n[SQLiteAgent] Query: {user_query}")
+        today = datetime.now().strftime("%Y-%m-%d")
 
-        plan = self._plan(user_query, history=history, pending=pending)
-        print(f"[SQLiteAgent] Intent: {plan.get('intent')} | Op: {plan.get('operation_type')}")
+        system = (
+            f"You are a voice assistant for {self.schema_desc or 'a business'}. "
+            "Use your tools to answer questions and process requests.\n\n"
+            f"SCHEMA:\n{self._schema()}\n\n"
+            f"TODAY: {today}\n\n"
+            "Rules:\n"
+            "- ALWAYS call confirm_action before insert_row, update_row, or delete_row\n"
+            "- Do NOT call any write tool in the same turn as confirm_action — wait for user reply\n"
+            "- 'change', 'update', 'switch', 'move', 'reschedule', 'amend' → use update_row (NOT insert)\n"
+            "- 'cancel', 'remove', 'delete' → use delete_row (NOT insert)\n"
+            "- Only use insert_row for brand-new records that do not already exist\n"
+            "- For inserts: never include system fields (*_id, status, created_at, source, prices/fees/amounts)\n"
+            "- Match user input to exact column values from the schema\n"
+            "- If query_table returns 0 rows, retry with a broader LIKE filter before giving up\n"
+            "- You may chain tools (e.g. query to find the existing record before updating it)\n"
+            "- Respond naturally for voice: no markdown, no bullet points"
+        )
 
-        if plan.get("operation_type") == "insert":
-            # Merge fields already collected in previous turns
-            if pending:
-                vals = plan.get("insert_values") or {}
-                for k, v in (pending.get("insert_values") or {}).items():
-                    if not vals.get(k) and v:
-                        vals[k] = v
-                plan["insert_values"] = vals
-                if not plan.get("insert_table"):
-                    plan["insert_table"] = pending.get("table", "")
+        contents = []
+        if history:
+            for turn in history[-4:]:
+                contents.append(types.Content(role="user",  parts=[types.Part(text=turn["user"])]))
+                contents.append(types.Content(role="model", parts=[types.Part(text=turn["assistant"])]))
 
-            if not plan.get("ready_to_insert"):
-                response = plan.get("ask_user") or "Could you provide the missing details?"
-                if plan.get("insert_table"):
-                    self._next_pending = {
-                        "table":         plan["insert_table"],
-                        "insert_values": plan.get("insert_values", {}),
-                    }
+        # Build user message — handle awaiting_confirmation separately
+        if pending and pending.get("awaiting_confirmation"):
+            action_type = pending.get("action_type", "action")
+            table       = pending.get("table", "")
+            summary     = pending.get("confirmation_summary", "the pending action")
+            if action_type == "insert":
+                payload = json.dumps(pending.get("values", {}))
+            elif action_type == "update":
+                payload = f"where={pending.get('where_sql', '')}, set={json.dumps(pending.get('update_set', {}))}"
+            elif action_type == "delete":
+                payload = f"where={pending.get('where_sql', '')}"
             else:
-                result = self._execute(plan)
-                print(f"[SQLiteAgent] Insert: {result}")
-                response = (
-                    self._speak(
-                        f"Confirmed insert into '{result['table']}'.\n"
-                        "Speak a natural 1-2 sentence confirmation. ALWAYS include: "
-                        "the person's name (any name/member_name/customer_name field), "
-                        "what was booked or created, and date/time if present.\n"
-                        "Document:\n"
-                        + json.dumps(result["document"], indent=2)
-                    ) if result.get("success")
-                    else f"I wasn't able to complete that. {result.get('error', 'Please try again.')}"
-                )
-        else:
-            results = self._execute(plan)
-            print(f"[SQLiteAgent] Rows: {len(results)}")
-            response = self._speak(
-                f'User asked: "{user_query}"\nIntent: {plan.get("intent")}\n'
-                f"Total found: {len(results)}\nData: {json.dumps(results[:20], indent=2)}"
+                payload = ""
+            write_tool = {"insert": "insert_row", "update": "update_row", "delete": "delete_row"}.get(action_type, action_type)
+            user_text = (
+                f"{user_query}\n"
+                f"[AWAITING CONFIRMATION — {summary}. "
+                f"Action: {action_type} on '{table}'. Details: {payload}. "
+                f"If the user confirmed (yes / correct / go ahead / sure), call {write_tool} with EXACTLY these details. "
+                f"If declined (no / cancel / stop), tell them the action was cancelled and do not write anything.]"
             )
+        else:
+            user_text = user_query
             if pending:
-                self._next_pending = pending
+                user_text += f"\n[INSERT IN PROGRESS — fields so far: {json.dumps(pending.get('insert_values', {}))}]"
 
-        print(f"[SQLiteAgent] Response: {response}\n")
-        return response
+        contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+
+        config = types.GenerateContentConfig(
+            system_instruction=system,
+            tools=[self._tools],
+            temperature=0.1,
+        )
+
+        # ReAct loop
+        for i in range(MAX_LOOP):
+            print(f"[SQLiteAgent] Loop {i + 1}")
+            response = self.gemini.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=contents,
+                config=config,
+            )
+
+            model_content = response.candidates[0].content
+            contents.append(model_content)
+
+            function_calls = [
+                p.function_call for p in model_content.parts
+                if hasattr(p, "function_call") and p.function_call
+            ]
+
+            if not function_calls:
+                text = "".join(
+                    p.text for p in model_content.parts
+                    if hasattr(p, "text") and p.text
+                )
+                return text.strip() or "Done."
+
+            tool_response_parts = []
+            early_return        = None
+
+            for fc in function_calls:
+                args   = dict(fc.args) if fc.args else {}
+                result = self._run_tool(fc.name, args)
+                print(f"[SQLiteAgent] {fc.name}({args}) -> {result}")
+
+                if "__confirm__" in result:
+                    self._next_pending = {
+                        "awaiting_confirmation":  True,
+                        "confirmation_summary":   result["__confirm__"],
+                        "action_type":            result["action_type"],
+                        "table":                  result["table"],
+                        "values":                 result["values"],
+                        "where_sql":              result["where_sql"],
+                        "update_set":             result["update_set"],
+                    }
+                    early_return = result["__confirm__"]
+                    tool_response_parts.append(types.Part(
+                        function_response=types.FunctionResponse(
+                            name=fc.name,
+                            response={"result": "Confirmation question sent to user."},
+                        )
+                    ))
+
+                elif "__ask_user__" in result:
+                    table   = result.get("table") or (pending or {}).get("table", "")
+                    partial = result.get("partial_values") or (pending or {}).get("insert_values", {})
+                    if table or partial:
+                        self._next_pending = {"table": table, "insert_values": partial}
+                    early_return = result["__ask_user__"]
+                    tool_response_parts.append(types.Part(
+                        function_response=types.FunctionResponse(
+                            name=fc.name,
+                            response={"result": "Question forwarded to user."},
+                        )
+                    ))
+
+                else:
+                    tool_response_parts.append(types.Part(
+                        function_response=types.FunctionResponse(
+                            name=fc.name,
+                            response=result,
+                        )
+                    ))
+
+            if early_return is not None:
+                return early_return
+
+            contents.append(types.Content(role="user", parts=tool_response_parts))
+
+        return "I wasn't able to complete that request. Please try again."
 
     def close(self):
-        pass  # Connections are opened/closed per query
+        pass
