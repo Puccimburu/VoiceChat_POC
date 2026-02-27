@@ -86,6 +86,8 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode }) {
             break;
 
           case 'conversation_pair':
+            // Notify the host page so it can refresh live data (enrolled counts, bookings, etc.)
+            window.dispatchEvent(new CustomEvent('clubhouse:data_changed'));
             break;
 
           case 'error':
@@ -222,10 +224,13 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode }) {
     if (streamingRef.current) return;
     streamingRef.current = true;
     setPhase('listening');
+    let selectedMember = {};
+    try { selectedMember = JSON.parse(localStorage.getItem('selectedMember') || '{}'); } catch (_) {}
     sendMsg('start_stream', {
       voice: voice || 'en-US-Neural2-J',
       mode: widgetMode,
-      selected_document: 'all'
+      selected_document: 'all',
+      selected_member: selectedMember,
     });
     mediaRecRef.current?.start();
   };

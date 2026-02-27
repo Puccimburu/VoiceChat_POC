@@ -337,10 +337,13 @@ function AppStreaming() {
 
             if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
               if (USE_STREAMING_STT) {
+                let selectedMember = {};
+                try { selectedMember = JSON.parse(localStorage.getItem('selectedMember') || '{}'); } catch (_) {}
                 sendMsg('start_stream', {
                   voice: selectedVoiceRef.current,
                   mode: modeRef.current,
-                  selected_document: selectedDocumentRef.current
+                  selected_document: selectedDocumentRef.current,
+                  selected_member: selectedMember,
                 });
                 mediaRecorderRef.current.start();
               } else {

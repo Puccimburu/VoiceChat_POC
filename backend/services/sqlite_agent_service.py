@@ -1,5 +1,6 @@
 """SQLite Query Agent — agentic: Gemini function calling + ReAct loop."""
 import json
+import random
 import time
 import sqlite3
 from datetime import datetime
@@ -11,6 +12,32 @@ _gemini      = genai.Client(api_key=GEMINI_API_KEY)
 _SCHEMA_TTL  = 300
 _schema_store: dict = {}
 MAX_LOOP     = 10
+_MAX_RETRIES = 4
+
+
+def _gemini_call(client, contents, config, model="gemini-2.5-flash-lite"):
+    """Call Gemini with exponential backoff on transient errors (503, SSL corruption)."""
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as e:
+            msg = str(e)
+            is_retryable = (
+                "503" in msg
+                or "UNAVAILABLE" in msg
+                or "overload" in msg.lower()
+                or "SSLV3" in msg
+                or "BAD_RECORD_MAC" in msg
+                or "SSL" in msg
+            )
+            if is_retryable and attempt < _MAX_RETRIES - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"[Gemini] transient error ({msg[:60]}), retry {attempt + 1}/{_MAX_RETRIES - 1} in {wait:.1f}s")
+                time.sleep(wait)
+            else:
+                raise
 
 
 class SQLiteAgent:
@@ -326,6 +353,7 @@ class SQLiteAgent:
             "- Match user input to exact column values from the schema\n"
             "- If query_table returns 0 rows, retry with a broader LIKE filter before giving up\n"
             "- You may chain tools (e.g. query to find the existing record before updating it)\n"
+            "- If the user's message is unclear or garbled, ask for clarification — never return empty text.\n"
             "- Respond naturally for voice: no markdown, no bullet points"
         )
 
@@ -372,26 +400,23 @@ class SQLiteAgent:
         # ReAct loop
         for i in range(MAX_LOOP):
             print(f"[SQLiteAgent] Loop {i + 1}")
-            response = self.gemini.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=contents,
-                config=config,
-            )
+            response = _gemini_call(self.gemini, contents, config)
 
             model_content = response.candidates[0].content
             contents.append(model_content)
 
+            parts = model_content.parts or [] if model_content else []
             function_calls = [
-                p.function_call for p in model_content.parts
+                p.function_call for p in parts
                 if hasattr(p, "function_call") and p.function_call
             ]
 
             if not function_calls:
                 text = "".join(
-                    p.text for p in model_content.parts
+                    p.text for p in parts
                     if hasattr(p, "text") and p.text
                 )
-                return text.strip() or "Done."
+                return text.strip() or "Sorry, I didn't quite catch that. Could you say that again?"
 
             tool_response_parts = []
             early_return        = None

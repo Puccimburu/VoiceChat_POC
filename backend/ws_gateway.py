@@ -45,9 +45,10 @@ class ClientState:
         self.authorized   = False
         self.api_key      = ""
         self.session_id   = ""
-        self.voice        = "en-US-Neural2-J"
-        self.mode         = "general"
-        self.selected_doc = "all"
+        self.voice           = "en-US-Neural2-J"
+        self.mode            = "general"
+        self.selected_doc    = "all"
+        self.selected_member: dict = {}
         self.stt_session: Optional[STTSession] = None
         self._pipeline_task: Optional[asyncio.Task] = None
         self._stop_event: asyncio.Event = asyncio.Event()
@@ -148,9 +149,10 @@ class ClientState:
             await self.send_error("failed to fetch documents")
 
     async def _handle_start_stream(self, data: dict):
-        self.voice        = data.get("voice", "en-US-Neural2-J") or "en-US-Neural2-J"
-        self.mode         = data.get("mode",  "general")          or "general"
-        self.selected_doc = data.get("selected_document", "all")  or "all"
+        self.voice           = data.get("voice", "en-US-Neural2-J") or "en-US-Neural2-J"
+        self.mode            = data.get("mode",  "general")          or "general"
+        self.selected_doc    = data.get("selected_document", "all")  or "all"
+        self.selected_member = data.get("selected_member") or {}
         if self.stt_session:
             self.stt_session.close()
         self.stt_session = STTSession()
@@ -182,8 +184,9 @@ class ClientState:
         session_id   = self.session_id
         api_key      = self.api_key
         voice        = self.voice
-        mode         = self.mode
-        selected_doc = self.selected_doc
+        mode            = self.mode
+        selected_doc    = self.selected_doc
+        selected_member = self.selected_member
 
         async def _run_pipeline():
             transcript = await stt._transcript_future
@@ -198,6 +201,7 @@ class ClientState:
                     self.send_audio_chunk, self.send_conv_pair,
                     self.send_complete, self.send_error,
                     stop_event,
+                    selected_member=selected_member,
                 )
             else:
                 await run_llm_pipeline(

@@ -186,6 +186,8 @@ export default function ChatWidget({ apiKey, agentName, apiUrl, wsUrl, voice, mo
               { role: 'user', text: data.user_query },
               { role: 'agent', text: data.llm_response },
             ]);
+            // Notify the host page so it can refresh live data (enrolled counts, bookings, etc.)
+            window.dispatchEvent(new CustomEvent('clubhouse:data_changed'));
             break;
 
           case 'error':
@@ -309,10 +311,13 @@ export default function ChatWidget({ apiKey, agentName, apiUrl, wsUrl, voice, mo
     if (streamingRef.current) return;
     streamingRef.current = true;
     setPhase('listening');
+    let selectedMember = {};
+    try { selectedMember = JSON.parse(localStorage.getItem('selectedMember') || '{}'); } catch (_) {}
     sendMsg('start_stream', {
       voice: voice || 'en-US-Neural2-J',
       mode: widgetMode,
       selected_document: 'all',
+      selected_member: selectedMember,
     });
     mediaRecRef.current?.start();
   };
