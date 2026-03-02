@@ -631,9 +631,8 @@ async def main():
 
 
 def _build_widget():
-    """Rebuild the widget bundle if source files are newer than the built output."""
+    """Rebuild widget bundles if source files are newer than the built outputs."""
     frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'frontend')
-    out_file     = os.path.join(frontend_dir, 'build', 'widget.js')
     src_dir      = os.path.join(frontend_dir, 'src')
 
     # Find the newest source file mtime
@@ -644,25 +643,32 @@ def _build_widget():
             if mtime > newest_src:
                 newest_src = mtime
 
-    built_mtime = os.path.getmtime(out_file) if os.path.exists(out_file) else 0.0
+    widgets = [
+        ('widget.js',      'build:widget'),
+        ('chat-widget.js', 'build:chat-widget'),
+    ]
 
-    if newest_src <= built_mtime:
-        logger.info("[widget] Build is up to date — skipping")
-        return
+    for out_name, npm_script in widgets:
+        out_file    = os.path.join(frontend_dir, 'build', out_name)
+        built_mtime = os.path.getmtime(out_file) if os.path.exists(out_file) else 0.0
 
-    logger.info("[widget] Source changed — building widget...")
-    result = subprocess.run(
-        "npm run build:widget",
-        cwd=frontend_dir,
-        capture_output=True,
-        text=True,
-        shell=True,
-    )
-    if result.returncode == 0:
-        logger.info("[widget] Widget built successfully")
-    else:
-        logger.warning("[widget] Build failed — serving previous build if available")
-        logger.warning(result.stderr[-500:] if result.stderr else "(no output)")
+        if newest_src <= built_mtime:
+            logger.info("[widget] %s is up to date — skipping", out_name)
+            continue
+
+        logger.info("[widget] Source changed — building %s...", out_name)
+        result = subprocess.run(
+            f"npm run {npm_script}",
+            cwd=frontend_dir,
+            capture_output=True,
+            text=True,
+            shell=True,
+        )
+        if result.returncode == 0:
+            logger.info("[widget] %s built successfully", out_name)
+        else:
+            logger.warning("[widget] Build failed for %s — serving previous build if available", out_name)
+            logger.warning(result.stderr[-500:] if result.stderr else "(no output)")
 
 
 if __name__ == "__main__":
