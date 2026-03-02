@@ -190,7 +190,7 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
         positiveSpeechThreshold: 0.5,
         negativeSpeechThreshold: 0.35,
         minSpeechFrames: 3,
-        redemptionFrames: 8,
+        redemptionFrames: 3,
         onSpeechStart: () => {
           const now = Date.now();
           const timeSinceLastEnd = now - lastEndTimeRef.current;

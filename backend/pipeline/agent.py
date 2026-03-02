@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from typing import Optional
 
 from pymongo import MongoClient
@@ -76,16 +77,33 @@ from config import PLATFORM_MONGO_URI, PLATFORM_DB
 
 logger = logging.getLogger("ws_gateway")
 
+# One MongoClient per unique connection string — shared across all sessions/tenants
+# that use the same database, avoiding a new TLS handshake on every voice turn.
+_client_cache: dict = {}
+
+def _get_mongo_client(conn_str: str) -> MongoClient:
+    if conn_str not in _client_cache:
+        _client_cache[conn_str] = MongoClient(conn_str)
+    return _client_cache[conn_str]
+
+# Cache db_config per api_key — avoids a find_one round-trip to Atlas on every voice turn.
+_db_config_cache: dict = {}
+_DB_CONFIG_TTL = 300  # seconds
 
 def _get_db_config(api_key: str) -> Optional[dict]:
+    now = time.monotonic()
+    cached = _db_config_cache.get(api_key)
+    if cached and (now - cached["ts"]) < _DB_CONFIG_TTL:
+        return cached["cfg"]
     try:
-        db  = MongoClient(PLATFORM_MONGO_URI)[PLATFORM_DB]
-        doc = db.api_keys.find_one({"key": api_key}, {"db_config": 1})
-        if not doc or not doc.get("db_config"):
-            return None
-        cfg = dict(doc["db_config"])
-        if "connection_string" in cfg:
-            cfg["connection_string"] = decrypt_connection_string(cfg["connection_string"])
+        platform_client = _get_mongo_client(PLATFORM_MONGO_URI)
+        doc = platform_client[PLATFORM_DB].api_keys.find_one({"key": api_key}, {"db_config": 1})
+        cfg = None
+        if doc and doc.get("db_config"):
+            cfg = dict(doc["db_config"])
+            if "connection_string" in cfg:
+                cfg["connection_string"] = decrypt_connection_string(cfg["connection_string"])
+        _db_config_cache[api_key] = {"cfg": cfg, "ts": now}
         return cfg
     except Exception as e:
         logger.error(f"DB config lookup error: {e}")
@@ -117,11 +135,15 @@ async def run_agent_pipeline(
         pending  = session_data.get("variables", {}).get("pending_booking")
         db_config = _get_db_config(api_key) if api_key else None
         db_type   = (db_config or {}).get("type", "mongodb")
-        agent     = (
-            SQLiteAgent(db_config=db_config)
-            if db_type == "sqlite"
-            else MongoDBAgent(db_config=db_config)
-        )
+        if db_type == "sqlite":
+            agent = SQLiteAgent(db_config=db_config)
+        else:
+            # Reuse a cached MongoClient for this connection string so the Atlas
+            # TLS handshake only happens once per unique tenant database endpoint.
+            # Each request gets a fresh MongoDBAgent (fresh per-query state) that
+            # wraps the shared client — safe for concurrent multi-tenant sessions.
+            conn_str = (db_config or {}).get("connection_string", PLATFORM_MONGO_URI)
+            agent = MongoDBAgent(db_config=db_config, mongo_client=_get_mongo_client(conn_str))
         # Normalize STT garbling before the agent sees the transcript
         normalized = _normalize_transcript(transcript)
         # Prepend selected member context so the agent knows who is speaking
@@ -152,7 +174,7 @@ async def run_agent_pipeline(
             }
             if response_text and response_text.strip() not in _skip:
                 add_to_conversation_history(session_id, transcript, response_text)
-            agent.close()
+            # Don't close — agent is cached and its connection is reused across turns
         return response_text
 
     try:

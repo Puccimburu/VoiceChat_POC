@@ -11,8 +11,10 @@ from config import GEMINI_API_KEY, PLATFORM_MONGO_URI, PLATFORM_DB
 
 _gemini      = genai.Client(api_key=GEMINI_API_KEY)
 _BLOCKED     = {"admin", "api_keys", "customers"}
-_SCHEMA_TTL  = 300
-_schema_store: dict = {}
+_SCHEMA_TTL        = 300
+_COLLECTIONS_TTL   = 300
+_schema_store:      dict = {}
+_collections_cache: dict = {}
 MAX_LOOP     = 10
 _MAX_RETRIES = 4
 
@@ -47,17 +49,25 @@ def _gemini_call(client, contents, config, model="gemini-2.5-flash-lite"):
 
 class MongoDBAgent:
 
-    def __init__(self, db_config: dict = None):
+    def __init__(self, db_config: dict = None, mongo_client: MongoClient = None):
         self.gemini       = _gemini
         cfg               = db_config or {}
         conn_str          = cfg.get("connection_string", PLATFORM_MONGO_URI)
         db_name           = cfg.get("database", PLATFORM_DB)
         self.schema_desc  = cfg.get("schema_description", "")
         cols              = cfg.get("collections", [])
-        self.mongo_client = MongoClient(conn_str)
+        # Accept a pre-built client so callers can share connection pools across tenants
+        self.mongo_client = mongo_client or MongoClient(conn_str)
         self.db           = self.mongo_client[db_name]
         self._cache_key   = (conn_str, db_name)
-        self.collections  = cols or [c for c in self.db.list_collection_names() if c not in _BLOCKED]
+        if not cols:
+            entry = _collections_cache.get(self._cache_key)
+            if entry and (time.time() - entry["ts"]) < _COLLECTIONS_TTL:
+                cols = entry["cols"]
+            else:
+                cols = [c for c in self.db.list_collection_names() if c not in _BLOCKED]
+                _collections_cache[self._cache_key] = {"cols": cols, "ts": time.time()}
+        self.collections  = cols
         self._tools                    = self._build_tools()
         self._next_pending             = None
         self._last_queried_for_booking = None   # tracks most-recent single-result facility/class lookup
@@ -87,6 +97,7 @@ class MongoDBAgent:
 
     def _invalidate_schema(self):
         _schema_store.pop(self._cache_key, None)
+        _collections_cache.pop(self._cache_key, None)
 
     # ── Tool definitions ────────────────────────────────────────────────
 
@@ -1070,7 +1081,15 @@ class MongoDBAgent:
                         f"Do NOT run CLASS BOOKING FLOW.]"
                     )
                 elif pd:
-                    user_text += f"\n[BOOKING IN PROGRESS — fields so far: {json.dumps(pd)}]"
+                    user_text += (
+                        f"\n[BOOKING IN PROGRESS — fields collected so far: {json.dumps(pd)}. "
+                        f"The user's reply above provides the missing date/time information. "
+                        f"Look up the date in the EXACT DATE LOOKUP table, verify the facility exists "
+                        f"(query_collection if not already confirmed), check for conflicts if needed, "
+                        f"then call confirm_action with ALL collected fields plus the date and time_slot. "
+                        f"Do NOT call ask_user again for fields already listed above. "
+                        f"Do NOT return empty — you must either call a tool or speak to the user.]"
+                    )
 
         contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
 
