@@ -13,6 +13,6 @@
 import { mountWidget } from './utils/widget-loader';
 import ChatWidget from './ChatWidget';
 
-(function () {
-  mountWidget(ChatWidget, 'script[data-api-key][src*="chat-widget"]');
+(async function () {
+  await mountWidget(ChatWidget, 'script[src*="chat-widget.js"]');
 })();

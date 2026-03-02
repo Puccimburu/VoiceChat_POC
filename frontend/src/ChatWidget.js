@@ -146,6 +146,12 @@ export default function ChatWidget({ apiKey, agentName, apiUrl, wsUrl, voice, mo
 
     const connect = () => {
       if (destroyedRef.current) return;
+
+      if (!apiKey) {
+        console.error('[chat-widget] apiKey is empty, cannot authenticate.');
+        return;
+      }
+
       const ws = new WebSocket(WS_URL);
       socketRef.current = ws;
 

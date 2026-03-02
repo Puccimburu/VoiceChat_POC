@@ -9,7 +9,7 @@ from google.cloud import speech as gcp_speech
 
 logger = logging.getLogger("ws_gateway")
 
-_STT_MAX_RETRIES = 1
+_STT_MAX_RETRIES = 3
 _STT_RETRY_DELAY = 0.2  # seconds before retry
 
 

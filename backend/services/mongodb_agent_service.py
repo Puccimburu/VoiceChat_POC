@@ -4,6 +4,7 @@ import random
 import time
 from datetime import datetime, timedelta
 from pymongo import MongoClient
+from bson import ObjectId
 from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY, PLATFORM_MONGO_URI, PLATFORM_DB
@@ -32,6 +33,9 @@ def _gemini_call(client, contents, config, model="gemini-2.5-flash-lite"):
                 or "SSLV3" in msg
                 or "BAD_RECORD_MAC" in msg
                 or "SSL" in msg
+                or "Server disconnected" in msg
+                or "RemoteProtocol" in msg
+                or "Connection reset" in msg
             )
             if is_retryable and attempt < _MAX_RETRIES - 1:
                 wait = (2 ** attempt) + random.uniform(0, 1)
@@ -142,7 +146,9 @@ class MongoDBAgent:
                 name="insert_document",
                 description=(
                     "Insert a new document. Call ONLY after confirm_action was accepted by the user. "
-                    "NEVER include system fields: _id, status, created_at, source, price/fee/amount."
+                    "NEVER include system fields: _id, status, created_at, source, price/fee/amount. "
+                    "For same-day group/family bookings, include num_spots=N (integer) to reserve N seats at once — "
+                    "the system creates N booking records automatically. Do NOT call this tool N times for same-day group bookings."
                 ),
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
@@ -260,6 +266,12 @@ class MongoDBAgent:
         if not col_name or col_name not in self.collections:
             return {"error": f"Collection '{col_name}' not available"}
         doc = dict(args.get("document") or {})
+
+        # Extract num_spots before setdefault calls (same-day group/family bookings)
+        num_spots = int(doc.pop("num_spots", 1) or 1)
+        if num_spots < 1:
+            num_spots = 1
+
         doc.setdefault("status",     "confirmed")
         doc.setdefault("created_at", datetime.now().isoformat())
         doc.setdefault("source",     "voice")
@@ -293,9 +305,13 @@ class MongoDBAgent:
                     except (ValueError, TypeError):
                         pass  # unparseable date — let the LLM handle it
 
-                # Capacity check
-                if cls.get("enrolled", 0) >= cls.get("capacity", 0):
-                    return {"error": f"'{class_name}' is fully booked (capacity {cls.get('capacity')})."}
+                # Capacity check — account for group bookings (num_spots)
+                spots_needed = num_spots
+                if cls.get("enrolled", 0) + spots_needed > cls.get("capacity", 0):
+                    remaining = max(0, cls.get("capacity", 0) - cls.get("enrolled", 0))
+                    if remaining == 0:
+                        return {"error": f"'{class_name}' is fully booked (capacity {cls.get('capacity')})."}
+                    return {"error": f"'{class_name}' only has {remaining} spot(s) left. Cannot book {spots_needed}."}
 
                 # Enrich to match manual booking format
                 class_id = cls.get("class_id", "")
@@ -320,12 +336,24 @@ class MongoDBAgent:
                 doc.setdefault("amount",       facility.get("rate_per_hour", 0))
 
         try:
-            self.db[col_name].insert_one(doc)
-            doc.pop("_id", None)
-            if class_name:
-                self.db["classes"].update_one({"name": class_name}, {"$inc": {"enrolled": 1}})
-            self._invalidate_schema()
-            return {"success": True, "collection": col_name, "document": doc}
+            if num_spots > 1:
+                # Same-day group/family booking — insert N copies with unique booking IDs
+                base_ts = int(time.time() * 1000)
+                for i in range(num_spots):
+                    copy = dict(doc)
+                    copy["booking_id"] = f"CL{base_ts}_{i}"
+                    self.db[col_name].insert_one(copy)
+                if class_name:
+                    self.db["classes"].update_one({"name": class_name}, {"$inc": {"enrolled": num_spots}})
+                self._invalidate_schema()
+                return {"success": True, "collection": col_name, "num_inserted": num_spots}
+            else:
+                self.db[col_name].insert_one(doc)
+                doc.pop("_id", None)
+                if class_name:
+                    self.db["classes"].update_one({"name": class_name}, {"$inc": {"enrolled": 1}})
+                self._invalidate_schema()
+                return {"success": True, "collection": col_name, "document": doc}
         except Exception as e:
             return {"error": str(e)}
 
@@ -367,6 +395,14 @@ class MongoDBAgent:
                         except (ValueError, TypeError):
                             pass  # unparseable date — let the LLM handle it
 
+            # Convert string _id to ObjectId so Gemini can pass query-result _id directly
+            filter_ = dict(filter_)
+            if "_id" in filter_:
+                try:
+                    filter_["_id"] = ObjectId(str(filter_["_id"]))
+                except Exception:
+                    pass
+
             result = self.db[col_name].update_one(filter_, {"$set": updates})
             self._invalidate_schema()
             return {
@@ -388,6 +424,14 @@ class MongoDBAgent:
         if not filter_:
             return {"error": "A filter is required for delete"}
         try:
+            # Convert string _id to ObjectId so Gemini can pass query-result _id directly
+            filter_ = dict(filter_)
+            if "_id" in filter_:
+                try:
+                    filter_["_id"] = ObjectId(str(filter_["_id"]))
+                except Exception:
+                    pass
+
             # For class booking cancellations: capture class_name before deleting
             class_name = None
             if col_name == "bookings":
@@ -431,7 +475,8 @@ class MongoDBAgent:
             return " ".join(parts) + ". Shall I go ahead?"
 
         if action_type == "delete":
-            parts = [f"I'd like to cancel{' ' + name + chr(39) + 's' if name else ''} {subject} booking"]
+            booking_word = "" if subject.lower().endswith("booking") else " booking"
+            parts = [f"I'd like to cancel{' ' + name + chr(39) + 's' if name else ''} {subject}{booking_word}"]
             if date: parts.append(f"on {date}")
             if slot: parts.append(f"at {slot}")
             return " ".join(parts) + ". Shall I proceed?"
@@ -596,6 +641,35 @@ class MongoDBAgent:
                         "real filter values (e.g. member_name + class_name)."
                     )
                 }
+            # Guard: validate day-of-week for class booking inserts AND reschedule updates BEFORE
+            # showing confirmation. Gemini sometimes derives dates incorrectly — catch it here
+            # so the user never hears a wrong date in the confirmation prompt.
+            if action_type_check in ("insert", "update"):
+                if action_type_check == "insert":
+                    doc_check   = args.get("document") or {}
+                    class_check = doc_check.get("class_name")
+                    date_check  = doc_check.get("booking_date")
+                else:  # update (reschedule)
+                    class_check = (args.get("filter") or {}).get("class_name")
+                    date_check  = (args.get("updates") or {}).get("booking_date")
+                if class_check and date_check:
+                    cls_check = self.db["classes"].find_one({"name": class_check}, {"schedule": 1, "_id": 0}) or {}
+                    allowed   = cls_check.get("schedule", {}).get("days", [])
+                    if allowed:
+                        try:
+                            dt_check  = datetime.fromisoformat(str(date_check))
+                            actual_day = dt_check.strftime("%A")
+                            if actual_day not in allowed:
+                                return {
+                                    "error": (
+                                        f"WRONG DATE: {date_check} is a {actual_day}, not a valid day for '{class_check}'. "
+                                        f"Valid days: {', '.join(allowed)}. "
+                                        f"You MUST look up the correct date from the EXACT DATE LOOKUP table in the system prompt "
+                                        f"and use that exact YYYY-MM-DD value — do NOT calculate or guess."
+                                    )
+                                }
+                        except (ValueError, TypeError):
+                            pass
             self._confirm_action_called = True
             summary = (args.get("summary") or "").strip()
             if not summary:
@@ -626,6 +700,30 @@ class MongoDBAgent:
 
     _DATE_TIME_WORDS = frozenset(["date", "time", "when", "slot", "day", "morning", "afternoon", "evening"])
 
+    # Simple yes-phrases that mean "go ahead" with no caveats or new info
+    _YES_PHRASES = frozenset({
+        "yes", "yes please", "yes please.", "yes,", "yes.", "yep", "yeah",
+        "sure", "sure.", "ok", "ok.", "okay", "okay.", "alright", "alright.",
+        "go ahead", "go ahead.", "do it", "do it.", "proceed", "proceed.",
+        "confirm", "confirm.", "correct", "correct.", "please", "please.",
+        "absolutely", "perfect", "great", "fine", "sounds good", "that's right",
+        "thats right", "that is correct", "that's correct",
+    })
+
+    @staticmethod
+    def _is_simple_yes(text: str) -> bool:
+        """True when the user's message is a plain confirmation with no new info."""
+        t = text.strip().lower().rstrip(".,!?")
+        if t in MongoDBAgent._YES_PHRASES:
+            return True
+        # Remove internal punctuation (commas, semicolons) so "yes, go ahead" → "yes go ahead"
+        t_clean = t.replace(",", "").replace(";", "").strip()
+        if t_clean in MongoDBAgent._YES_PHRASES:
+            return True
+        # "yes please", "yes go ahead", "yes do it" — short yes-prefixed phrases
+        words = t_clean.split()
+        return bool(words) and words[0] == "yes" and len(words) <= 3
+
     def query(self, user_query: str, history: list = None, pending: dict = None) -> str:
         self._next_pending             = None
         self._last_queried_for_booking = None
@@ -635,6 +733,47 @@ class MongoDBAgent:
         self._confirm_action_called  = False
         self._incoming_awaiting      = bool(pending and pending.get("awaiting_confirmation"))
         self._incoming_action_type   = (pending.get("action_type", "") if self._incoming_awaiting else "")
+
+        # ── Fast-path: bypass Gemini for simple confirmations ──────────────
+        # When we're awaiting a confirmation and the user says a plain "yes",
+        # execute the write directly in Python to avoid Gemini re-asking.
+        # Strip any [CURRENT USER: ...] prefix that agent.py prepends.
+        _speech_only = user_query
+        if _speech_only.startswith("[CURRENT USER:"):
+            _bracket_end = _speech_only.find("]")
+            if _bracket_end != -1:
+                _speech_only = _speech_only[_bracket_end + 1:].strip()
+        if self._incoming_awaiting and self._is_simple_yes(_speech_only):
+            action_type = pending.get("action_type", "")
+            collection  = pending.get("collection", "")
+            summary     = pending.get("confirmation_summary", "")
+            print(f"[Agent] Fast-path confirm: {action_type} on {collection}")
+            if action_type == "insert":
+                result = self._do_insert({"collection": collection, "document": pending.get("document", {})})
+            elif action_type == "update":
+                result = self._do_update({"collection": collection, "filter": pending.get("filter", {}), "updates": pending.get("updates", {})})
+            elif action_type == "delete":
+                result = self._do_delete({"collection": collection, "filter": pending.get("filter", {})})
+            else:
+                result = {"error": f"Unknown action type: {action_type}"}
+            # _next_pending stays None — clear the awaiting state
+            if result.get("success"):
+                # Convert the confirmation question into a past-tense done message
+                done = summary.replace("Shall I go ahead?", "").replace("Shall I proceed?", "").strip().rstrip(".")
+                done = done.replace("I'd like to book",   "I've booked")
+                done = done.replace("I'd like to update", "I've updated")
+                done = done.replace("I'd like to cancel", "I've cancelled")
+                return (done + ". Done!").lstrip()
+            else:
+                err = result.get("error")
+                if not err:
+                    if action_type == "delete":
+                        err = "I couldn't find that booking to cancel."
+                    elif action_type == "update":
+                        err = "No matching record found to update."
+                    else:
+                        err = "Something went wrong — please try again."
+                return f"I wasn't able to complete that. {err}"
 
         now   = datetime.now()
         today = now.strftime("%Y-%m-%d")
@@ -667,11 +806,38 @@ class MongoDBAgent:
             "Use your tools to answer questions and process requests.\n\n"
             f"SCHEMA:\n{self._schema()}\n\n"
             f"{date_ref}\n"
-            "When the user says 'tomorrow', 'this Saturday', 'next Monday', etc., look up the exact date "
-            "from the EXACT DATE LOOKUP above — never recalculate.\n"
+            "CRITICAL DATE RULE: When the user says any day name ('Monday', 'Tuesday', 'Wednesday', etc.), "
+            "you MUST look that day up in the EXACT DATE LOOKUP table above and use that exact YYYY-MM-DD value. "
+            "NEVER calculate or derive dates yourself. NEVER use a date that is not in the table. "
+            "If the table says 'this Tuesday: 2026-03-03', you MUST use 2026-03-03 — not any other date.\n"
             f"AVAILABLE COLLECTIONS: {self.collections}\n\n"
             "Rules:\n"
-            "- INTENT RECOGNITION (read this first, before all other rules):\n"
+            "- GREETINGS / AMBIGUOUS SHORT MESSAGES (check this FIRST before everything else):\n"
+            "  If the user's message is a greeting or a short acknowledgment with NO clear task intent "
+            "AND there is NO pending action to confirm — examples: 'Yes', 'OK', 'Hi', 'Hello', 'Here', "
+            "'Sure', 'Go ahead', 'Ready', 'Testing', single words, or anything that does not express "
+            "a specific request — respond with a short natural greeting like 'How can I help you today?' "
+            "and DO NOT call any tool or query any collection.\n"
+            "- INTENT RECOGNITION (read this second, after the greeting check):\n"
+            "  * LISTING EXISTING BOOKINGS — if the user asks 'what bookings do I have?', "
+            "'which bookings do I have?', 'list my bookings', 'what have I booked?', "
+            "'what are my current bookings?', 'do I have any bookings?', "
+            "'which bookings do I have available?', 'show me my bookings', 'what's booked for me?' "
+            "— query_collection('bookings') filtered by the current member's name and list the results. "
+            "Do NOT run CLASS BOOKING FLOW. 'Available' here means 'currently on my schedule', not 'spots available in a class'.\n"
+            "  * REFORMAT BOOKING DATES — if the user asks 'give me the day not the date', "
+            "'show me the day of the week', 'what day is that?', 'tell me the day name', "
+            "or any request to see day names instead of YYYY-MM-DD dates — "
+            "re-present the already-listed bookings using day names derived from their booking_date field "
+            "(e.g. 2026-03-02 is a Monday). Do NOT query again — the data is already in context.\n"
+            "  * CANCEL ALL EXCEPT ONE DAY — if the user says 'I only want [class] on [day]', "
+            "'keep [class] on [day] only', '[class] on [day] only', 'remove [class] on all other days', "
+            "'cancel [class] except [day]', or any phrasing meaning keep one day and remove the rest:\n"
+            "  1. query_collection('bookings') to find all [class] bookings for this member.\n"
+            "  2. Identify which bookings are NOT on [day] (use booking_date to check the day of week).\n"
+            "  3. For each non-[day] booking, call confirm_action (action_type='delete') then delete_document.\n"
+            "     Handle one deletion at a time. Never try to update an existing booking's date instead — "
+            "updating does NOT remove the extra bookings.\n"
             "  * JOINING A CLASS — ANY phrasing that means the user wants to attend, join, enrol in, "
             "book into, or get a spot in a class. Examples: 'enrol me in yoga', 'book for me a slot in yoga', "
             "'get me a spot in yoga', 'I'd like to join yoga', 'put me in yoga', 'reserve me a place in yoga', "
@@ -683,12 +849,47 @@ class MongoDBAgent:
             "→ go to FACILITY BOOKING FLOW.\n"
             "  * CHANGING/RESCHEDULING — user mentions an EXISTING booking and wants to change date/time. "
             "→ go to RESCHEDULING flow.\n"
-            "  * CANCELLING — user wants to cancel or remove an existing booking. → use delete_document.\n"
+            "  * CANCELLING ONE OF MULTIPLE IDENTICAL BOOKINGS — if there are N > 1 identical bookings "
+            "(same class and date) and the user says 'cancel one', 'remove one', 'cancel one of them', "
+            "'delete one', or similar meaning cancel just a single instance:\n"
+            "  1. Call query_collection('bookings') with filter {member_name, class_name, booking_date} "
+            "to get fresh results including _id values.\n"
+            "  2. Take the _id string from the FIRST result as your filter: {'_id': '<first_id_string>'}.\n"
+            "  3. Call confirm_action with summary: "
+            "'I\\'d like to cancel one of your [N] [class] bookings on [date]. Shall I proceed?'\n"
+            "  4. Call delete_document with collection='bookings' and filter {'_id': '<first_id_string>'}. "
+            "The system converts string _id to ObjectId automatically — pass it exactly as returned.\n"
+            "  * CANCELLING — user wants to cancel or remove an existing booking:\n"
+            "  1. If the user provides only a class name (no date), call query_collection('bookings') with "
+            "filter {member_name, class_name} to find all matching bookings.\n"
+            "     - If there is exactly ONE match: proceed directly to confirm_action.\n"
+            "     - If there are MULTIPLE matches on DIFFERENT dates: list them to the user and ask "
+            "'Which date would you like to cancel?' before calling confirm_action.\n"
+            "     - If there are MULTIPLE IDENTICAL matches (same class AND same date): "
+            "→ use CANCELLING ONE OF MULTIPLE IDENTICAL BOOKINGS flow above.\n"
+            "  2. The confirm_action summary for a delete MUST always say: "
+            "'I\\'d like to cancel your [class] booking on [day], [date]. Shall I proceed?' "
+            "— never use a vague summary like 'I\\'d like to cancel booking.'\n"
+            "  3. The delete_document filter MUST include booking_date (and class_name and member_name) "
+            "so only the specific booking is deleted — never filter by class_name alone.\n"
+            "  * QUESTION DURING CONFIRMATION — if [AWAITING CONFIRMATION] or [RESCHEDULE IN PROGRESS] is in context "
+            "and the user asks a clarifying question (date lookup, 'when is Monday?', 'what date is that?', "
+            "'when is the class?', 'what day is March 9th?') instead of confirming or declining: "
+            "answer the question briefly from context (use EXACT DATE LOOKUP for dates), "
+            "then immediately re-present the pending confirmation question so the user knows it is still waiting. "
+            "NEVER abandon the pending action just because the user asked a question.\n"
             "  * ABANDONING — if the user says 'forget it', 'never mind', 'skip', 'ignore', 'forget this', "
             "'don't bother', 'leave it', or similar — abandon any pending action and say OK naturally. "
             "Do NOT book anything.\n"
-            "  * MULTIPLE SLOTS — if the user asks for N slots, sessions, or bookings in the same class "
-            "(e.g. 'I need 3 slots in swimming', 'book me 3 sessions of yoga') — follow MULTI-SLOT BOOKING FLOW.\n"
+            "  * MULTIPLE SLOTS — distinguish between two cases:\n"
+            "    SAME-DAY GROUP (N spots/seats/spaces on ONE specific day, for family/friends/group): "
+            "'3 spots on Wednesday', '2 seats for my family on Friday', 'book us all on Monday', "
+            "'we need 3 places on the same day', 'all three on Wednesday', 'book 3 for Wednesday' "
+            "→ MULTI-SLOT SAME-DAY FLOW. The key signal is N spots + a single named day.\n"
+            "    MULTI-SESSION (N sessions/classes on DIFFERENT days, OR multiple different days named): "
+            "'3 sessions of yoga', 'book me 3 times', 'Tuesday and Thursday', '3 bookings over 3 days' "
+            "→ MULTI-SLOT BOOKING FLOW.\n"
+            "    When truly ambiguous, ask: 'Would you like 3 spots on the same day, or 3 sessions on different days?'\n"
             "  If you are unsure of intent, ask one short clarifying question. "
             "NEVER return empty text or silence — always either call a tool or speak to the user.\n"
             "- MANDATORY: call confirm_action BEFORE insert_document, update_document, or delete_document — "
@@ -701,18 +902,31 @@ class MongoDBAgent:
             "  If the user wants to change a date, time, or time slot on an EXISTING booking of the SAME TYPE "
             "(e.g. change a facility booking date, or change a class booking date):\n"
             "  1. query_collection('bookings') with a filter for member_name to find the existing record.\n"
-            "  2. If the user has not yet stated WHICH day or date they want, ask them first "
-            "(e.g. 'Which day would you like to move it to?'). Do NOT pick a day on their behalf.\n"
-            "     Once the user gives a day name, look up the exact date in the EXACT DATE LOOKUP table — "
-            "never derive the new date from the existing booking's date.\n"
-            "     Before proposing the new date, verify it falls on one of the class's scheduled days "
-            "(from schedule.days). If it does not, tell the user and ask for a valid day.\n"
-            "  3. Call confirm_action with action_type='update', showing what will change.\n"
-            "  3. Only after the user confirms, call update_document.\n"
-            "     CRITICAL: The filter for update_document must NOT include the field being changed. "
-            "Use member_name + class_name (or member_name + facility_name) to identify the record — "
-            "never put booking_date or time_slot in the filter when those are the fields being updated.\n"
+            "  2. After finding the record, if the user has NOT yet given the new day, call ask_user with:\n"
+            "       question='Which day would you like to move [class] to? It runs on [schedule.days].'\n"
+            "       collection='bookings'\n"
+            "       partial_document={'_action': 'reschedule', "
+            "'filter': {'member_name': '<name>', 'class_name': '<class>'}, "
+            "'old_date': '<existing booking_date>', 'class_name': '<class_name>'}\n"
+            "     IMPORTANT: always use ask_user (not plain text) so the reschedule context is preserved between turns.\n"
+            "  3. When [RESCHEDULE IN PROGRESS] context appears and the user gives a day name:\n"
+            "     - Look up the YYYY-MM-DD date from the EXACT DATE LOOKUP table — never calculate it.\n"
+            "     - Verify the day is in schedule.days. If not, tell the user and ask for a valid day.\n"
+            "     - Call confirm_action with action_type='update', "
+            "filter from the [RESCHEDULE IN PROGRESS] context, "
+            "updates={'booking_date': '<new YYYY-MM-DD>'}, "
+            "and a summary: '[class] moved from [old_date] to [new_date] for [member].'\n"
+            "  4. Only after the user confirms, call update_document with the same filter and updates.\n"
+            "     CRITICAL: filter must NOT include booking_date — use member_name + class_name only.\n"
             "  NEVER call insert_document for a same-type reschedule — this would create a duplicate.\n"
+            "- [RESCHEDULE IN PROGRESS] handling:\n"
+            "  * When this tag appears, you are mid-reschedule. "
+            "The user's reply is the new day — go straight to step 3 (confirm_action with action_type='update'). "
+            "Do NOT run CLASS BOOKING FLOW, do NOT query the class, do NOT ask 'which day would you like to book?'\n"
+            "  * If the user's reply is incomplete ('Moving to.', 'Move it to.', 'On...', 'Change to.', "
+            "'Monday', 'Tuesday', etc. — any single day name counts as a complete answer) — "
+            "if ONLY a fragment with no day name: ask 'Which day would you like?' using ask_user again "
+            "with the same partial_document values from the [RESCHEDULE IN PROGRESS] context.\n"
             "- CANCEL + REBOOK — applies to TWO situations:\n"
             "  (a) Changing a FACILITY booking to a CLASS booking, or vice versa.\n"
             "  (b) Changing from one CLASS to a DIFFERENT CLASS (e.g. 'switch from Power Yoga to Morning Yoga').\n"
@@ -754,13 +968,26 @@ class MongoDBAgent:
             "  7. Only after the user confirms, call insert_document.\n"
             "- CLASS BOOKING FIELDS: when inserting a class booking into 'bookings', the document MUST use "
             "the field 'class_name' (NOT 'facility_name'). Example: {member_id, member_name, class_name, booking_date}.\n"
-            "- MULTI-SLOT BOOKING FLOW — when the user wants N sessions of the same class:\n"
+            "- MULTI-SLOT SAME-DAY FLOW — when the user wants N spots on the SAME single day (family/group booking):\n"
             "  1. query_collection('classes') to get the class schedule and fee.\n"
-            "  2. From the EXACT DATE LOOKUP table, find the next N dates that match the class's schedule.days. "
-            "List all N dates to the user (e.g. 'Saturday March 1st, Saturday March 8th, Saturday March 15th').\n"
-            "  3. Call confirm_action ONCE with a summary listing ALL N dates and total cost (fee × N). "
-            "Example: 'I'd like to book Swimming for Beginners for Lucy on March 1st, 8th, and 15th at 08:00-09:00. "
-            "Total cost: 240. Shall I go ahead?'\n"
+            "  2. Look up the specified day in the EXACT DATE LOOKUP table to get the exact YYYY-MM-DD date.\n"
+            "     If the user hasn't named a day yet, ask which day they would like.\n"
+            "  3. Call confirm_action ONCE with a clear summary: "
+            "'I'd like to book [N] spots in [class] on [date] at [time]. "
+            "Total cost: [fee x N]. Shall I go ahead?'\n"
+            "  4. After the user confirms, call insert_document ONCE with the document including "
+            "num_spots=[N] and the single booking_date. The system automatically creates N booking records. "
+            "Do NOT call insert_document N times for same-day bookings.\n"
+            "  5. Confirm: '[N] spots have been booked in [class] for [date].'\n"
+            "- MULTI-SLOT BOOKING FLOW — when the user wants N sessions on DIFFERENT days:\n"
+            "  1. query_collection('classes') to get the class schedule and fee.\n"
+            "  2. Determine the dates: "
+            "if the user named specific days (e.g. 'Tuesday and Thursday'), look each one up in the EXACT DATE LOOKUP table. "
+            "If the user asked for N sessions without naming days, find the next N dates from the table that match schedule.days. "
+            "NEVER calculate dates yourself — only use dates from the EXACT DATE LOOKUP table.\n"
+            "  3. Call confirm_action EXACTLY ONCE with a summary listing ALL dates and total cost (fee × N). "
+            "Example: 'I'd like to book Aqua Aerobics for you on Tuesday March 3rd and Thursday March 5th at 10:00-11:00. "
+            "Total cost: 100. Shall I go ahead?'\n"
             "  4. After the user confirms, call insert_document ONCE FOR EACH DATE as separate calls in the same response. "
             "Each document must have: member_id, member_name, class_name, booking_date (YYYY-MM-DD).\n"
             "  5. After all inserts, confirm how many sessions were booked and the dates.\n"
@@ -777,6 +1004,11 @@ class MongoDBAgent:
             "member_id, member_name, facility_name, booking_date (YYYY-MM-DD), time_slot.\n"
             "- ALWAYS include the cost in every booking confirmation summary — state the fee (classes) or rate_per_hour (facilities) "
             "so the user knows the price before confirming. Never omit cost from a confirmation.\n"
+            "- VERIFICATION — if the user asks 'did you book X?', 'you just booked X right?', 'what did you just do?', "
+            "'you booked X for me, right?' — answer based on the conversation history without calling any tool or restarting any flow.\n"
+            "- CORRECTION — if the user says 'no, I meant X' or 'actually I wanted X' after a booking summary or completed action, "
+            "treat this as a correction: use class/facility data already in context (do NOT re-query the class unless needed), "
+            "go directly to the correct BOOKING FLOW step based on what the user now wants.\n"
             "- Never repeat the same question twice. If the user's answer is incomplete or invalid, explain why and give them the valid options.\n"
             "- IMPORTANT: Always either call a tool or speak to the user. Never return empty text or silence. "
             "If you are unsure what the user wants, ask for clarification.\n"
@@ -807,9 +1039,16 @@ class MongoDBAgent:
                 f"[AWAITING CONFIRMATION — {summary}. "
                 f"Action: {action_type} on '{collection}'. Details: {payload}. "
                 f"If the user confirmed (yes / correct / go ahead / sure), call {action_type}_document with EXACTLY these details. "
+                f"If the user says 'yes' AND mentions a slot count (e.g. 'yes, two slots', 'yes, book me two', "
+                f"'yes, two of them', 'yes please book me two slots') — confirm the booking for the same date "
+                f"and immediately switch to MULTI-SLOT SAME-DAY FLOW for N slots on that date. "
+                f"If the user asks a simple date/timing question ('when is that?', 'what date is that?', "
+                f"'when is Monday?', 'what day is it?', 'when is the class?') — answer it briefly from context "
+                f"(use the EXACT DATE LOOKUP table for date lookups) and then re-present the pending confirmation. "
+                f"Do NOT call query_collection for a simple date question, do NOT abandon the pending action. "
                 f"If the user asks about the schedule, days, or availability (e.g. 'which days does it run?', "
                 f"'is it on Sunday too?'), call query_collection to get the accurate schedule from the class/facility "
-                f"and answer correctly — do NOT just repeat the date in the pending booking. "
+                f"and answer correctly — do NOT just repeat the date in the pending booking — then re-present the confirmation. "
                 f"If the user asks about or prefers a different day/time (e.g. 'what about Sunday?', 'can I do Monday?', "
                 f"'make it 6 PM'), treat this as a request to change that field. "
                 f"Look up the new date in the EXACT DATE LOOKUP table, update that detail in the booking, "
@@ -820,7 +1059,18 @@ class MongoDBAgent:
         else:
             user_text = user_query
             if pending:
-                user_text += f"\n[BOOKING IN PROGRESS — fields so far: {json.dumps(pending.get('insert_document', {}))}]"
+                pd = pending.get("insert_document", {})
+                if pd.get("_action") == "reschedule":
+                    user_text += (
+                        f"\n[RESCHEDULE IN PROGRESS — existing booking: "
+                        f"filter={json.dumps(pd.get('filter', {}))}, "
+                        f"old_date={pd.get('old_date')}, class_name={pd.get('class_name')}. "
+                        f"The user's reply is the new day. Look it up in the EXACT DATE LOOKUP table and "
+                        f"call confirm_action with action_type='update' using the filter above. "
+                        f"Do NOT run CLASS BOOKING FLOW.]"
+                    )
+                elif pd:
+                    user_text += f"\n[BOOKING IN PROGRESS — fields so far: {json.dumps(pd)}]"
 
         contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
 

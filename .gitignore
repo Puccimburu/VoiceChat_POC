@@ -43,9 +43,8 @@ voice_input.wav
 # Build
 frontend/build/
 
-# Go compiled binaries
-backend-go/*.exe
-backend-go/voice-gateway
+# MongoDB dumps
+dump/
 
 # CRA build artifacts that land in public/
 frontend/public/static/

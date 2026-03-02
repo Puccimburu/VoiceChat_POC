@@ -13,14 +13,6 @@ _config = types.GenerateContentConfig(systemInstruction=GEMINI_SYSTEM_INSTRUCTIO
 _MAX_RETRIES = 4
 
 
-def prewarm_gemini():
-    """Pre-warm Gemini connection to reduce TTFB"""
-    try:
-        client.models.generate_content(model=GEMINI_MODEL, contents="hi", config=_config)
-    except Exception:
-        pass  # Ignore errors, this is just for warming
-
-
 def generate_response_stream(prompt):
     """Generate streaming response from Gemini with retry on 503 overload."""
     for attempt in range(_MAX_RETRIES):

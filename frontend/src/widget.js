@@ -14,6 +14,6 @@
 import { mountWidget } from './utils/widget-loader';
 import VoiceWidget from './VoiceWidget';
 
-(function () {
-  mountWidget(VoiceWidget, 'script[data-api-key][src*="widget"]');
+(async function () {
+  await mountWidget(VoiceWidget, 'script[src*="widget.js"]');
 })();
