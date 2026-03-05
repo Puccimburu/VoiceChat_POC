@@ -78,7 +78,7 @@ class STTSession:
                 sample_rate_hertz=48000,
                 language_code="en-US",
                 enable_automatic_punctuation=True,
-                model="latest_long",
+                model="latest_short",
             ),
             single_utterance=True,
         )

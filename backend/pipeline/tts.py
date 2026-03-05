@@ -10,7 +10,9 @@ logger = logging.getLogger("ws_gateway")
 async def dispatch_tts(
     text: str, voice: str, num: int,
     results_q: asyncio.Queue, stop_event: asyncio.Event,
+    _allowed: list = None,
 ):
+    """_allowed is a mutable [bool] flag — set to False to suppress queuing after TTS completes."""
     if stop_event.is_set():
         return
     loop = asyncio.get_event_loop()
@@ -18,7 +20,7 @@ async def dispatch_tts(
         audio_b64, words = await loop.run_in_executor(
             _executor, lambda: synthesize_sentence_with_timing(text, voice)
         )
-        if not stop_event.is_set():
+        if not stop_event.is_set() and (_allowed is None or _allowed[0]):
             await results_q.put((num, text, audio_b64, words))
     except Exception as e:
         logger.error(f"[TTS] synthesis error num={num}: {e}")

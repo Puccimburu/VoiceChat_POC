@@ -3,15 +3,24 @@
  *
  * Connects to the WebSocket gateway using the customer's API key.
  * The backend validates the key and routes queries to their database.
+ *
+ * VAD: energy-based (AnalyserNode) — instant start/stop, no ML model overhead.
+ *   SPEECH_THRESHOLD  2.5  — average amplitude deviation that means "speech"
+ *   SILENCE_MS        300  — ms of sustained silence before stopping
+ *   COOLDOWN_MS       500  — min gap between sessions (prevents re-trigger)
  */
 import { useState, useRef, useEffect } from 'react';
-import { MicVAD } from '@ricky0123/vad-web';
 
 const DEFAULT_WS_URL = process.env.REACT_APP_WS_URL || 'ws://localhost:8080/ws';
 
-export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, widgetBaseUrl }) {
-  const WS_URL = wsUrl || DEFAULT_WS_URL;
+const SPEECH_THRESHOLD = 2.5;   // avg deviation from 128 that counts as speech
+const SILENCE_MS       = 300;   // sustained silence (ms) before end-of-speech
+const COOLDOWN_MS      = 500;   // minimum gap between two recording sessions
+
+export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode }) {
+  const WS_URL     = wsUrl || DEFAULT_WS_URL;
   const widgetMode = mode || 'general';
+
   const [phase, setPhase]         = useState('idle');   // idle | listening | thinking | speaking
   const [error, setError]         = useState('');
   const [connected, setConnected] = useState(false);
@@ -19,9 +28,10 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
   const socketRef         = useRef(null);
   const audioCtxRef       = useRef(null);
   const processorRef      = useRef(null);
+  const analyserRef       = useRef(null);
+  const animFrameRef      = useRef(null);
   const streamRef         = useRef(null);
   const mediaRecRef       = useRef(null);
-  const micVADRef         = useRef(null);
   const streamingRef      = useRef(false);
   const audioQueueRef     = useRef([]);
   const currentAudioRef   = useRef(null);
@@ -29,10 +39,10 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
   const requestIdRef      = useRef(null);
   const epochRef          = useRef(0);
   const lastEndTimeRef    = useRef(0);
-  const destroyedRef      = useRef(false);   // true after unmount — no reconnect
-  const audioReadyRef     = useRef(false);   // true after first successful mic init
-  const reconnectDelayRef = useRef(1000);    // current backoff delay in ms
-  const reconnectTimerRef = useRef(null);    // pending setTimeout handle
+  const destroyedRef      = useRef(false);
+  const audioReadyRef     = useRef(false);
+  const reconnectDelayRef = useRef(1000);
+  const reconnectTimerRef = useRef(null);
 
   // ── Send helper ──────────────────────────────────────────────────
   const sendMsg = (type, data) => {
@@ -71,7 +81,6 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
             reconnectDelayRef.current = 1000;
             setConnected(true);
             setError('');
-            // Only init audio once — mic permission persists across reconnects.
             if (!audioReadyRef.current) {
               audioReadyRef.current = true;
               initAudio();
@@ -92,7 +101,6 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
             break;
 
           case 'conversation_pair':
-            // Notify the host page so it can refresh live data.
             window.dispatchEvent(new CustomEvent('clubhouse:data_changed'));
             break;
 
@@ -122,9 +130,7 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
         }, delay);
       };
 
-      ws.onerror = () => {
-        setConnected(false);
-      };
+      ws.onerror = () => { setConnected(false); };
     };
 
     connect();
@@ -132,8 +138,8 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
     return () => {
       destroyedRef.current = true;
       clearTimeout(reconnectTimerRef.current);
+      cancelAnimationFrame(animFrameRef.current);
       socketRef.current?.close();
-      micVADRef.current?.destroy();
       audioCtxRef.current?.close();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -146,9 +152,9 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 48000,
-          channelCount: 1,
+          autoGainControl:  true,
+          sampleRate:       48000,
+          channelCount:     1,
         }
       });
       streamRef.current = stream;
@@ -156,7 +162,7 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
       audioCtxRef.current = new AudioContext({ sampleRate: 48000 });
       const source = audioCtxRef.current.createMediaStreamSource(stream);
 
-      // ScriptProcessor streams raw PCM to STT while recording is active
+      // ScriptProcessor — streams raw PCM to STT while recording
       processorRef.current = audioCtxRef.current.createScriptProcessor(4096, 1, 1);
       processorRef.current.onaudioprocess = (e) => {
         e.outputBuffer.getChannelData(0).fill(0);
@@ -174,6 +180,58 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
       source.connect(processorRef.current);
       processorRef.current.connect(audioCtxRef.current.destination);
 
+      // AnalyserNode — energy-based VAD (no ML model, no frame buffering)
+      const analyser = audioCtxRef.current.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      const bufLen  = analyser.frequencyBinCount;
+      const dataArr = new Uint8Array(bufLen);
+      let silenceStart = null;
+
+      const tick = () => {
+        animFrameRef.current = requestAnimationFrame(tick);
+        if (!analyserRef.current) return;
+
+        analyserRef.current.getByteTimeDomainData(dataArr);
+        let sum = 0;
+        for (let i = 0; i < bufLen; i++) sum += Math.abs(dataArr[i] - 128);
+        const level = sum / bufLen;
+        const now   = Date.now();
+
+        if (level > SPEECH_THRESHOLD) {
+          // ── Speech detected ─────────────────────────────────────
+          silenceStart = null;
+          if (!streamingRef.current && (now - lastEndTimeRef.current) > COOLDOWN_MS) {
+            // Barge-in: cancel AI playback before starting new turn
+            if (currentAudioRef.current) {
+              currentAudioRef.current.pause();
+              currentAudioRef.current = null;
+              audioQueueRef.current   = [];
+              epochRef.current++;
+              sendMsg('barge_in', { session_id: sessionIdRef.current });
+            }
+            startRecording();
+          }
+        } else if (streamingRef.current) {
+          // ── Silence while recording ──────────────────────────────
+          if (!silenceStart) {
+            silenceStart = now;
+          } else if (now - silenceStart > SILENCE_MS) {
+            lastEndTimeRef.current = now;
+            stopRecording();
+            silenceStart = null;
+          }
+        } else {
+          silenceStart = null;
+        }
+      };
+
+      animFrameRef.current = requestAnimationFrame(tick);
+      console.log('[vad] energy-based VAD initialized');
+
+      // MediaRecorder — triggers end_speech when stopped
       mediaRecRef.current = new MediaRecorder(stream);
       mediaRecRef.current.onstop = () => {
         const reqId = crypto.randomUUID();
@@ -181,42 +239,6 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
         sendMsg('end_speech', { session_id: sessionIdRef.current, request_id: reqId });
         setPhase('thinking');
       };
-
-      // Silero VAD — same config as AppStreaming.js
-      micVADRef.current = await MicVAD.new({
-        stream,
-        workletURL: `${widgetBaseUrl}/vad.worklet.bundle.min.js`,
-        modelURL: `${widgetBaseUrl}/silero_vad_v5.onnx`,
-        positiveSpeechThreshold: 0.5,
-        negativeSpeechThreshold: 0.35,
-        minSpeechFrames: 3,
-        redemptionFrames: 3,
-        onSpeechStart: () => {
-          const now = Date.now();
-          const timeSinceLastEnd = now - lastEndTimeRef.current;
-          const COOLDOWN_MS = 500;
-
-          if (!streamingRef.current && timeSinceLastEnd > COOLDOWN_MS) {
-            // Barge-in: stop AI playback if speaking
-            if (currentAudioRef.current) {
-              currentAudioRef.current.pause();
-              currentAudioRef.current = null;
-              audioQueueRef.current = [];
-              epochRef.current++;
-              sendMsg('barge_in', { session_id: sessionIdRef.current });
-            }
-            startRecording();
-          }
-        },
-        onSpeechEnd: () => {
-          if (streamingRef.current) {
-            lastEndTimeRef.current = Date.now();
-            stopRecording();
-          }
-        },
-      });
-      micVADRef.current.start();
-      console.log('[vad] Silero VAD initialized and listening');
 
     } catch (e) {
       setError('Microphone access denied');
@@ -231,10 +253,10 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
     let selectedMember = {};
     try { selectedMember = JSON.parse(localStorage.getItem('selectedMember') || '{}'); } catch (_) {}
     sendMsg('start_stream', {
-      voice: voice || 'en-US-Neural2-J',
-      mode: widgetMode,
+      voice:             voice || 'en-US-Neural2-J',
+      mode:              widgetMode,
       selected_document: 'all',
-      selected_member: selectedMember,
+      selected_member:   selectedMember,
     });
     if (mediaRecRef.current?.state === 'inactive') {
       mediaRecRef.current.start();
@@ -279,7 +301,6 @@ export default function VoiceWidget({ apiKey, agentName, voice, wsUrl, mode, wid
   };
 
   const handleTap = () => {
-    // Resume AudioContext on first user gesture (browser auto-suspends it)
     if (audioCtxRef.current?.state === 'suspended') {
       audioCtxRef.current.resume();
     }
@@ -344,9 +365,9 @@ const styles = {
     color: '#e1e4e8',
     boxSizing: 'border-box',
   },
-  header: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' },
-  dot: { width: '8px', height: '8px', borderRadius: '50%' },
-  name: { fontWeight: '600', fontSize: '14px', color: '#f0f6fc' },
+  header:  { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' },
+  dot:     { width: '8px', height: '8px', borderRadius: '50%' },
+  name:    { fontWeight: '600', fontSize: '14px', color: '#f0f6fc' },
   error: {
     background: '#3d1a1a', border: '1px solid #f85149', borderRadius: '8px',
     padding: '8px 12px', fontSize: '12px', color: '#f85149', marginBottom: '12px',
@@ -356,7 +377,7 @@ const styles = {
     width: '80px', height: '80px', borderRadius: '50%', background: '#0d1117',
     border: '2px solid', cursor: 'pointer', margin: '0 auto 12px', transition: 'border-color 0.3s',
   },
-  bars: { display: 'flex', alignItems: 'center', gap: '3px', height: '36px' },
-  bar: { width: '4px', borderRadius: '2px', transition: 'height 0.3s' },
+  bars:   { display: 'flex', alignItems: 'center', gap: '3px', height: '36px' },
+  bar:    { width: '4px', borderRadius: '2px', transition: 'height 0.3s' },
   status: { textAlign: 'center', fontSize: '13px', fontWeight: '500', marginBottom: '14px', transition: 'color 0.3s' },
 };

@@ -789,7 +789,15 @@ class MongoDBAgent:
         now   = datetime.now()
         today = now.strftime("%Y-%m-%d")
 
-        # Build a 2-week date lookup — model must use these exact values, no arithmetic needed
+        # Build date lookup: past 7 days + today + next 14 days
+        # Past days allow the model to resolve booking dates like "March 3rd" that are already in the DB.
+        _past_lines = []
+        for delta in range(7, 0, -1):
+            d     = now - timedelta(days=delta)
+            dval  = d.strftime("%Y-%m-%d")
+            label = "yesterday" if delta == 1 else f"last {d.strftime('%A')} ({d.strftime('%b')} {d.day})"
+            _past_lines.append(f"{label}: {dval}")
+
         _seen_this: set = set()
         _seen_next: set = set()
         _this_lines, _next_lines = [], []
@@ -809,7 +817,7 @@ class MongoDBAgent:
         date_ref = (
             f"TODAY: {now.strftime('%A')} {today}\n"
             "EXACT DATE LOOKUP — use these values directly, do NOT recalculate:\n  "
-            + "\n  ".join(_this_lines + _next_lines)
+            + "\n  ".join(_past_lines + _this_lines + _next_lines)
         )
 
         system = (
@@ -834,7 +842,11 @@ class MongoDBAgent:
             "'which bookings do I have?', 'list my bookings', 'what have I booked?', "
             "'what are my current bookings?', 'do I have any bookings?', "
             "'which bookings do I have available?', 'show me my bookings', 'what's booked for me?' "
-            "— query_collection('bookings') filtered by the current member's name and list the results. "
+            f"— query_collection('bookings') with filter {{\"member_name\": \"<name>\", \"booking_date\": {{\"$gte\": \"{today}\"}}}} "
+            "to return only upcoming bookings (today and future). "
+            "EXCEPTION: if the user explicitly asks about past, previous, old, or historical bookings "
+            "('which bookings did I previously have?', 'show me past bookings', 'what did I have before?') "
+            f"— use filter {{\"member_name\": \"<name>\", \"booking_date\": {{\"$lt\": \"{today}\"}}}} instead. "
             "Do NOT run CLASS BOOKING FLOW. 'Available' here means 'currently on my schedule', not 'spots available in a class'.\n"
             "  * REFORMAT BOOKING DATES — if the user asks 'give me the day not the date', "
             "'show me the day of the week', 'what day is that?', 'tell me the day name', "
@@ -860,9 +872,11 @@ class MongoDBAgent:
             "→ go to FACILITY BOOKING FLOW.\n"
             "  * CHANGING/RESCHEDULING — user mentions an EXISTING booking and wants to change date/time. "
             "→ go to RESCHEDULING flow.\n"
-            "  * CANCELLING ONE OF MULTIPLE IDENTICAL BOOKINGS — if there are N > 1 identical bookings "
+            "  * CANCELLING ONE OF MULTIPLE IDENTICAL BOOKINGS — ONLY when the user's intent is to CANCEL/DELETE "
+            "(NOT reschedule/move/change). Applies when there are N > 1 identical bookings "
             "(same class and date) and the user says 'cancel one', 'remove one', 'cancel one of them', "
-            "'delete one', or similar meaning cancel just a single instance:\n"
+            "'delete one', or similar. If the user says 'reschedule one', 'move one', 'change one' — "
+            "go to RESCHEDULING flow instead, not here.\n"
             "  1. Call query_collection('bookings') with filter {member_name, class_name, booking_date} "
             "to get fresh results including _id values.\n"
             "  2. Take the _id string from the FIRST result as your filter: {'_id': '<first_id_string>'}.\n"
@@ -871,11 +885,16 @@ class MongoDBAgent:
             "  4. Call delete_document with collection='bookings' and filter {'_id': '<first_id_string>'}. "
             "The system converts string _id to ObjectId automatically — pass it exactly as returned.\n"
             "  * CANCELLING — user wants to cancel or remove an existing booking:\n"
-            "  1. If the user provides only a class name (no date), call query_collection('bookings') with "
-            "filter {member_name, class_name} to find all matching bookings.\n"
-            "     - If there is exactly ONE match: proceed directly to confirm_action.\n"
-            "     - If there are MULTIPLE matches on DIFFERENT dates: list them to the user and ask "
-            "'Which date would you like to cancel?' before calling confirm_action.\n"
+            "  1. Query: use filter {member_name, class_name} if class is known, or {member_name, booking_date} "
+            "if only a date was given. If the user said a specific date (e.g. 'March 3rd'), look it up in the "
+            "EXACT DATE LOOKUP table and include booking_date in the filter so only that booking is returned.\n"
+            "     - If there is exactly ONE match: you MUST call confirm_action with action_type='delete'. "
+            "Do NOT return empty — the booking is right there in the query result. Use booking_date, "
+            "class_name, and member_name from the result as the filter.\n"
+            "     - If there are MULTIPLE matches but the user DID specify a date or class name: identify the "
+            "matching record from the results and call confirm_action directly — do NOT ask again.\n"
+            "     - If there are MULTIPLE matches on DIFFERENT dates AND the user gave no specific date/class: "
+            "list them and ask 'Which booking would you like to cancel?'\n"
             "     - If there are MULTIPLE IDENTICAL matches (same class AND same date): "
             "→ use CANCELLING ONE OF MULTIPLE IDENTICAL BOOKINGS flow above.\n"
             "  2. The confirm_action summary for a delete MUST always say: "
@@ -883,6 +902,8 @@ class MongoDBAgent:
             "— never use a vague summary like 'I\\'d like to cancel booking.'\n"
             "  3. The delete_document filter MUST include booking_date (and class_name and member_name) "
             "so only the specific booking is deleted — never filter by class_name alone.\n"
+            "  CRITICAL: After query_collection returns results in a cancel/delete context, you MUST "
+            "immediately call confirm_action or speak to the user. Returning empty is NEVER acceptable.\n"
             "  * QUESTION DURING CONFIRMATION — if [AWAITING CONFIRMATION] or [RESCHEDULE IN PROGRESS] is in context "
             "and the user asks a clarifying question (date lookup, 'when is Monday?', 'what date is that?', "
             "'when is the class?', 'what day is March 9th?') instead of confirming or declining: "
@@ -1049,7 +1070,8 @@ class MongoDBAgent:
                 f"{user_query}\n"
                 f"[AWAITING CONFIRMATION — {summary}. "
                 f"Action: {action_type} on '{collection}'. Details: {payload}. "
-                f"If the user confirmed (yes / correct / go ahead / sure), call {action_type}_document with EXACTLY these details. "
+                f"If the user confirmed (yes / correct / go ahead / sure), call {action_type}_document "
+                f"with EXACTLY these details — do NOT call confirm_action again, the confirmation was already shown. "
                 f"If the user says 'yes' AND mentions a slot count (e.g. 'yes, two slots', 'yes, book me two', "
                 f"'yes, two of them', 'yes please book me two slots') — confirm the booking for the same date "
                 f"and immediately switch to MULTI-SLOT SAME-DAY FLOW for N slots on that date. "

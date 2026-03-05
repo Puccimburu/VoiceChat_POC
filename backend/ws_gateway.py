@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import os
+import random
 import secrets
 import subprocess
 import sys
@@ -41,11 +42,20 @@ from services.security_service       import check_origin_allowed, encrypt_connec
 from services.mongodb_agent_service  import MongoDBAgent
 from services.sqlite_agent_service   import SQLiteAgent
 from services.tts_service            import synthesize_sentence_with_timing
-from pipeline.base                   import _executor
+from pipeline.base                   import _executor, _SENTINEL
 from pipeline.stt                    import STTSession
 from pipeline.llm                    import run_llm_pipeline
 from pipeline.agent                  import run_agent_pipeline
+from pipeline.tts                    import dispatch_tts, run_ordering_worker
+from pipeline.helpers                import is_short_greeting
 from config                          import PLATFORM_MONGO_URI, PLATFORM_DB
+
+_EARLY_FILLERS = [
+    "One moment.", "Sure, one moment.", "Let me check that.",
+    "Let me look into that.", "Happy to help.", "Of course.",
+    "Let me think about that.", "Sure thing.", "Absolutely.",
+    "Hmm, let me think.", "Let me consider that.",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -506,11 +516,31 @@ class ClientState:
         selected_member = self.selected_member
 
         async def _run_pipeline():
+            # Create audio queue + ordering worker immediately — before STT completes.
+            # Dispatch a filler early so the user hears something while Google STT
+            # processes (~300-500ms). The _filler_ok flag lets us suppress it after
+            # the fact if the transcript turns out to be a short greeting.
+            results_q     = asyncio.Queue()
+            ordering_task = asyncio.create_task(
+                run_ordering_worker(results_q, self.send_audio_chunk, stop_event)
+            )
+            _filler_ok = [True]
+            asyncio.create_task(
+                dispatch_tts(random.choice(_EARLY_FILLERS), voice, 0, results_q, stop_event, _allowed=_filler_ok)
+            )
+
             transcript = await stt._transcript_future
             if not transcript or not transcript.strip():
                 logger.info(f"[ws] [{session_id[:8]}] empty transcript")
+                _filler_ok[0] = False
+                await results_q.put(_SENTINEL)
+                await ordering_task
                 await self.send_complete()
                 return
+            # Suppress filler for greetings — the response is fast and "One moment."
+            # before "Hello! How can I help?" sounds odd.
+            if is_short_greeting(transcript):
+                _filler_ok[0] = False
             logger.info(f"[ws] [{session_id[:8]}] transcript: {transcript!r}")
             if mode == "agent":
                 await run_agent_pipeline(
@@ -519,6 +549,8 @@ class ClientState:
                     self.send_complete, self.send_error,
                     stop_event,
                     selected_member=selected_member,
+                    _results_q=results_q,
+                    _ordering_task=ordering_task,
                 )
             else:
                 await run_llm_pipeline(

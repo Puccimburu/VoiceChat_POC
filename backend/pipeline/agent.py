@@ -115,19 +115,29 @@ async def run_agent_pipeline(
     send_audio_chunk, send_conv_pair, send_complete, send_error,
     stop_event: asyncio.Event,
     selected_member: dict = None,
+    _results_q: asyncio.Queue = None,
+    _ordering_task = None,
 ):
     loop      = asyncio.get_event_loop()
-    results_q: asyncio.Queue = asyncio.Queue()
     tts_tasks = []
 
-    ordering_task = asyncio.create_task(
-        run_ordering_worker(results_q, send_audio_chunk, stop_event)
-    )
-
-    if not is_short_greeting(transcript):
-        tts_tasks.append(asyncio.create_task(
-            dispatch_tts(pick_filler(transcript), voice, 0, results_q, stop_event)
-        ))
+    # Accept a pre-created queue/worker from the caller (early filler optimisation).
+    # If not provided, create them here as before.
+    if _results_q is not None:
+        results_q     = _results_q
+        ordering_task = _ordering_task
+        # Filler was already dispatched by the caller as num=0; real sentences start at 1.
+        _next_tts_num = 1
+    else:
+        results_q     = asyncio.Queue()
+        ordering_task = asyncio.create_task(
+            run_ordering_worker(results_q, send_audio_chunk, stop_event)
+        )
+        if not is_short_greeting(transcript):
+            tts_tasks.append(asyncio.create_task(
+                dispatch_tts(pick_filler(transcript), voice, 0, results_q, stop_event)
+            ))
+        _next_tts_num = 1
 
     def _run_agent():
         _, session_data = get_or_create_session(session_id)
@@ -192,7 +202,7 @@ async def run_agent_pipeline(
         await ordering_task
         return
 
-    sentence_count = 0
+    sentence_count = _next_tts_num - 1
     buf = response_text
     while True:
         sentences, buf = extract_sentences(buf)
