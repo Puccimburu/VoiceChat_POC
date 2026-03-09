@@ -67,7 +67,7 @@ def _normalize_transcript(text: str) -> str:
     return text
 
 from .base import _executor, _SENTINEL
-from .helpers import is_short_greeting, pick_filler, extract_sentences
+from .helpers import is_short_greeting, pick_filler, extract_sentences, pick_greeting_reply
 from .tts import dispatch_tts, run_ordering_worker
 from services.session_service import get_or_create_session, add_to_conversation_history, save_session
 from services.security_service import decrypt_connection_string
@@ -88,7 +88,7 @@ def _get_mongo_client(conn_str: str) -> MongoClient:
 
 # Cache db_config per api_key — avoids a find_one round-trip to Atlas on every voice turn.
 _db_config_cache: dict = {}
-_DB_CONFIG_TTL = 300  # seconds
+_DB_CONFIG_TTL = 3600  # seconds (1 hour — api_keys rarely change)
 
 def _get_db_config(api_key: str) -> Optional[dict]:
     now = time.monotonic()
@@ -110,6 +110,39 @@ def _get_db_config(api_key: str) -> Optional[dict]:
         return None
 
 
+def prewarm_connections():
+    """Pre-warm MongoDB connections at startup so the first voice turn has no cold-start latency."""
+    try:
+        t = time.monotonic()
+        platform_client = _get_mongo_client(PLATFORM_MONGO_URI)
+        platform_client.admin.command("ping")
+        logger.info(f"[prewarm] platform Atlas ping OK ({(time.monotonic()-t)*1000:.0f}ms)")
+
+        now = time.monotonic()
+        docs = list(platform_client[PLATFORM_DB].api_keys.find(
+            {"active": True}, {"key": 1, "db_config": 1}
+        ))
+        for doc in docs:
+            key = doc.get("key")
+            cfg = doc.get("db_config")
+            if not key or not cfg:
+                continue
+            try:
+                cfg = dict(cfg)
+                if "connection_string" in cfg:
+                    cfg["connection_string"] = decrypt_connection_string(cfg["connection_string"])
+                _db_config_cache[key] = {"cfg": cfg, "ts": now}
+                conn_str = cfg.get("connection_string", PLATFORM_MONGO_URI)
+                if cfg.get("type", "mongodb") == "mongodb":
+                    client = _get_mongo_client(conn_str)
+                    client.admin.command("ping")
+                    logger.info(f"[prewarm] customer DB ping OK for key={key[:8]}...")
+            except Exception as e:
+                logger.warning(f"[prewarm] customer DB ping failed for key={key[:8]}...: {e}")
+    except Exception as e:
+        logger.warning(f"[prewarm] platform ping failed: {e}")
+
+
 async def run_agent_pipeline(
     transcript: str, session_id: str, api_key: str, voice: str,
     send_audio_chunk, send_conv_pair, send_complete, send_error,
@@ -117,9 +150,11 @@ async def run_agent_pipeline(
     selected_member: dict = None,
     _results_q: asyncio.Queue = None,
     _ordering_task = None,
+    _t0: float = None,
 ):
     loop      = asyncio.get_event_loop()
     tts_tasks = []
+    t0 = _t0 if _t0 is not None else time.monotonic()
 
     # Accept a pre-created queue/worker from the caller (early filler optimisation).
     # If not provided, create them here as before.
@@ -131,7 +166,7 @@ async def run_agent_pipeline(
     else:
         results_q     = asyncio.Queue()
         ordering_task = asyncio.create_task(
-            run_ordering_worker(results_q, send_audio_chunk, stop_event)
+            run_ordering_worker(results_q, send_audio_chunk, stop_event, t0=t0)
         )
         if not is_short_greeting(transcript):
             tts_tasks.append(asyncio.create_task(
@@ -143,7 +178,9 @@ async def run_agent_pipeline(
         _, session_data = get_or_create_session(session_id)
         history  = session_data.get("history", [])[-4:]
         pending  = session_data.get("variables", {}).get("pending_booking")
+        t_db = time.monotonic()
         db_config = _get_db_config(api_key) if api_key else None
+        logger.info(f"[TIMING] db_config: {(time.monotonic()-t_db)*1000:.0f}ms")
         db_type   = (db_config or {}).get("type", "mongodb")
         if db_type == "sqlite":
             agent = SQLiteAgent(db_config=db_config)
@@ -164,9 +201,16 @@ async def run_agent_pipeline(
                    f"member_id={m.get('member_id', '')}, "
                    f"membership={m.get('membership_type', '')}] ")
             query = ctx + normalized
+        # Fast-path: greetings bypass the LLM entirely (0 Gemini calls)
+        if is_short_greeting(normalized) and not pending:
+            logger.info("[Agent] greeting fast-path — skipping LLM")
+            return pick_greeting_reply(normalized)
+
         response_text = ""
+        t_llm = time.monotonic()
         try:
             response_text = agent.query(query, history=history, pending=pending)
+            logger.info(f"[TIMING] agent.query (DB+LLM): {(time.monotonic()-t_llm)*1000:.0f}ms | total since transcript: {(time.monotonic()-t0)*1000:.0f}ms")
         finally:
             _, sd = get_or_create_session(session_id)
             next_pending = getattr(agent, "_next_pending", None)
@@ -221,6 +265,7 @@ async def run_agent_pipeline(
         ))
 
     await asyncio.gather(*tts_tasks, return_exceptions=True)
+    logger.info(f"[TIMING] TTS synthesized (first audio imminent): {(time.monotonic()-t0)*1000:.0f}ms since transcript")
     await results_q.put(_SENTINEL)
     await ordering_task
 

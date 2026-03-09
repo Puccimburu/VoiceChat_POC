@@ -9,7 +9,7 @@ load_dotenv()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Platform database (stores customers, API keys, db configs)
-PLATFORM_MONGO_URI = os.environ.get("PLATFORM_MONGO_URI", "mongo connection string here")
+PLATFORM_MONGO_URI = os.environ.get("PLATFORM_MONGO_URI", "mongodb+srv://execouser:kvBCLWs1xRSHNq6M@ac-vtaexoy.mftcjhw.mongodb.net/genaiexeco-devlocal?authSource=admin")
 PLATFORM_DB        = os.environ.get("PLATFORM_DB", "Test")
 
 # Session Configuration

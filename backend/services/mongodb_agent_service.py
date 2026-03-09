@@ -1,8 +1,70 @@
 """MongoDB Query Agent — agentic: Gemini function calling + ReAct loop."""
 import json
+import logging
 import random
+import re
 import time
 from datetime import datetime, timedelta
+
+logger = logging.getLogger("ws_gateway")
+
+# ── Pre-fetch intent detection ─────────────────────────────────────────────
+_BOOKINGS_READ_RE = re.compile(
+    r"what'?s\s+on\s+my\s+bookings?"
+    r"|show\s+(?:me\s+)?my\s+bookings?"
+    r"|list\s+(?:my\s+)?bookings?"
+    r"|what\s+(?:are\s+)?my\s+bookings?"
+    r"|how\s+many\s+bookings?"
+    r"|which\s+bookings?\s+(?:do\s+i|have\s+i)"
+    r"|do\s+i\s+have\s+(?:any\s+)?bookings?"
+    r"|my\s+(?:upcoming\s+|current\s+|existing\s+)?bookings?"
+    r"|what\s+have\s+i\s+booked"
+    r"|what'?s\s+booked\s+for\s+me"
+    r"|bookings?\s+(?:i\s+have|i\s+(?:currently\s+)?have\s+now)"
+    r"|bookings?\s+(?:available\s+)?for\s+me"
+    r"|(?:what|which)\s+bookings?\s+(?:are\s+)?(?:there\s+)?for\s+me"
+    r"|(?:the\s+)?bookings?\s+i\s+have(?:\s+now|\s+currently)?",
+    re.IGNORECASE,
+)
+_BOOKING_WRITE_RE = re.compile(
+    r"\b(?:book\s+me|book\s+for\s+me|enroll\s+me|enrol\s+me|sign\s+me|join|"
+    r"reserve\s+me|get\s+me\s+into|add\s+me\s+to|put\s+me\s+in|"
+    r"i\s+want\s+to\s+book|i\s+would\s+like\s+to\s+book|i'd\s+like\s+to\s+book|"
+    r"can\s+you\s+book)\b",
+    re.IGNORECASE,
+)
+_CLASSES_READ_RE = re.compile(
+    r"what\s+classes?\s+(?:are|do\s+you\s+have|are\s+available|is\s+available|are\s+on)"
+    r"|available\s+classes?"
+    r"|show\s+(?:me\s+)?(?:the\s+)?classes?"
+    r"|list\s+(?:all\s+)?classes?"
+    r"|what\s+are\s+(?:the|your)\s+classes?",
+    re.IGNORECASE,
+)
+_MEMBER_NAME_RE = re.compile(r'\[CURRENT USER:.*?name=([^,\]]+)', re.IGNORECASE)
+
+# Write-intent detector — queries matching this go to the ReAct loop only
+_WRITE_INTENT_RE = re.compile(
+    r'\b(?:book\s+me|book\s+for\s+me|enroll\s+me|enrol\s+me|sign\s+me|'
+    r'reserve\s+me|get\s+me\s+into|add\s+me\s+to|put\s+me\s+in|'
+    r'i\s+want\s+to\s+book|i\s+would\s+like\s+to\s+book|i\'?d\s+like\s+to\s+book|'
+    r'can\s+you\s+book|cancel|reschedule|change\s+my\s+booking|'
+    r'move\s+my\s+booking|remove\s+my\s+booking|delete\s+my\s+booking)\b',
+    re.IGNORECASE,
+)
+
+# Topic detectors for LLM DB collection routing
+_CLASSES_TOPIC_RE    = re.compile(r'\bclass(?:es)?\b|\binstructor\b|\bsession\b|\bspots?\b', re.IGNORECASE)
+_FACILITIES_TOPIC_RE = re.compile(r'\bfacilit|\bcourt\b|\bpool\b|\bgym\b|\broom\b|\bhall\b|\bstudio\b', re.IGNORECASE)
+# Softer "my bookings" topic — catches phrasings not covered by _BOOKINGS_READ_RE Direct-DB path
+_MY_BOOKINGS_TOPIC_RE = re.compile(
+    r'\bmy\s+(?:upcoming\s+)?(?:bookings?|sessions?|appointments?|reservations?|schedule)\b'
+    r'|\bbookings?\s+i\s+(?:have|made|got)\b'
+    r'|\bwhat\s+(?:have\s+i|am\s+i)\s+booked\b'
+    r'|\bwhat\s+(?:do\s+i\s+have|is\s+(?:on\s+)?my\s+schedule)\b',
+    re.IGNORECASE,
+)
+
 from pymongo import MongoClient
 from bson import ObjectId
 from google import genai
@@ -100,6 +162,159 @@ class MongoDBAgent:
         _collections_cache.pop(self._cache_key, None)
 
     # ── Tool definitions ────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_bookings(results: list, member_name: str) -> str:
+        if not results:
+            return "You don't have any upcoming bookings."
+        parts = []
+        for bk in results:
+            subject = bk.get("class_name") or ""
+            if not subject:
+                fac = bk.get("facility_name", "booking")
+                subject = fac[7:] if fac.startswith("Class: ") else fac
+            date_str  = bk.get("booking_date", "")
+            time_slot = bk.get("time_slot", "")
+            display_date = date_str
+            if date_str:
+                try:
+                    dt = datetime.fromisoformat(str(date_str))
+                    display_date = f"{dt.strftime('%A')}, {dt.strftime('%B')} {dt.day}"
+                except (ValueError, TypeError):
+                    pass
+            entry = subject
+            if display_date:
+                entry += f" on {display_date}"
+            if time_slot:
+                time_part = time_slot.split("·")[-1].strip() if "·" in time_slot else time_slot
+                entry += f" at {time_part}"
+            parts.append(entry)
+        count = len(parts)
+        if count == 1:
+            return f"You have one upcoming booking: {parts[0]}."
+        joined = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+        return f"You have {count} upcoming bookings: {joined}."
+
+    @staticmethod
+    def _format_classes(results: list) -> str:
+        if not results:
+            return "There are no classes available at the moment."
+        sentences = []
+        for cls in results:
+            name       = cls.get("name", "class")
+            instructor = cls.get("instructor", "")
+            schedule   = cls.get("schedule", {})
+            days       = schedule.get("days", [])
+            time_str   = schedule.get("time", "")
+            capacity   = cls.get("capacity", 0)
+            enrolled   = cls.get("enrolled", 0)
+            spots_left = max(0, capacity - enrolled)
+            line = name
+            if instructor:
+                line += f" with {instructor}"
+            if days:
+                line += f" on {', '.join(days)}"
+            if time_str:
+                line += f" at {time_str}"
+            if capacity:
+                word = "spot" if spots_left == 1 else "spots"
+                line += f", {spots_left} {word} left"
+            sentences.append(line + ".")
+        count = len(sentences)
+        if count == 1:
+            return f"We have one class available: {sentences[0]}"
+        return f"We have {count} classes available. " + " ".join(sentences)
+
+    def _try_direct_answer(self, user_query: str, today: str) -> str:
+        """Return a fully-formatted spoken response for simple read intents,
+        bypassing the LLM entirely. Returns '' to fall through to LLM."""
+        speech = user_query
+        if speech.startswith("[CURRENT USER:"):
+            idx = speech.find("]")
+            if idx != -1:
+                speech = speech[idx + 1:].strip()
+
+        # Write intents always go to LLM
+        if _BOOKING_WRITE_RE.search(speech):
+            return ""
+
+        m = _MEMBER_NAME_RE.search(user_query)
+        member_name = m.group(1).strip() if m else None
+
+        if _BOOKINGS_READ_RE.search(speech) and member_name:
+            data = self._do_query({
+                "collection": "bookings",
+                "filter": {"member_name": member_name, "booking_date": {"$gte": today}},
+            })
+            logger.info(f"[Agent] direct-answer: bookings for {member_name} ({data.get('count', 0)} results)")
+            return self._format_bookings(data.get("results", []), member_name)
+
+        if _CLASSES_READ_RE.search(speech):
+            data = self._do_query({"collection": "classes", "filter": {}, "limit": 20})
+            logger.info(f"[Agent] direct-answer: classes ({data.get('count', 0)} results)")
+            return self._format_classes(data.get("results", []))
+
+        return ""
+
+    def _try_llm_db_answer(self, speech: str, member_name: str = None) -> str:
+        """Fetch relevant MongoDB data and answer with a single Gemini call (no ReAct loop).
+        Returns '' to fall through to the ReAct loop if no data found or on error."""
+        # Route to relevant collections based on query topic
+        to_fetch = []
+        booking_filter = None
+        if _MY_BOOKINGS_TOPIC_RE.search(speech) and member_name and "bookings" in self.collections:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            booking_filter = {"member_name": member_name, "booking_date": {"$gte": today}}
+            to_fetch.append("bookings")
+        if _CLASSES_TOPIC_RE.search(speech):
+            to_fetch.append("classes")
+        if _FACILITIES_TOPIC_RE.search(speech):
+            if "facilities" in self.collections:
+                to_fetch.append("facilities")
+        if not to_fetch:
+            # Generic read — fetch all info collections (skip bookings/members for privacy)
+            skip = _BLOCKED | {"bookings", "members"}
+            to_fetch = [c for c in self.collections if c not in skip]
+
+        context_parts = []
+        for col in to_fetch:
+            if col not in self.collections:
+                continue
+            filt = booking_filter if (col == "bookings" and booking_filter) else {}
+            data = self._do_query({"collection": col, "filter": filt, "limit": 20})
+            results = data.get("results", [])
+            if results:
+                # Strip internal system fields to keep context clean and token-efficient
+                clean = [
+                    {k: v for k, v in r.items() if k not in ("_id", "created_at", "source", "status")}
+                    for r in results
+                ]
+                context_parts.append(f"Collection '{col}':\n{json.dumps(clean, indent=2)}")
+
+        if not context_parts:
+            return ""
+
+        db_context = "\n\n".join(context_parts)
+        prompt = (
+            f"You are a voice assistant for {self.schema_desc or 'a business'}. "
+            f"Answer the question using ONLY the data below. "
+            f"Be natural and conversational — no markdown, no bullet points, keep it concise.\n\n"
+            f"DATA:\n{db_context}\n\n"
+            f"QUESTION: {speech}"
+        )
+        try:
+            response = _gemini_call(
+                self.gemini,
+                prompt,
+                types.GenerateContentConfig(temperature=0.1),
+            )
+            parts = (response.candidates[0].content.parts or []) if response.candidates else []
+            text = "".join(p.text for p in parts if hasattr(p, "text") and p.text).strip()
+            logger.info(f"[Agent] LLM-DB answer for: {speech[:60]!r}")
+            return text
+        except Exception as e:
+            logger.error(f"[Agent] LLM-DB error: {e}")
+            return ""
 
     def _build_tools(self) -> types.Tool:
         obj = types.Schema(type=types.Type.OBJECT)
@@ -789,6 +1004,24 @@ class MongoDBAgent:
         now   = datetime.now()
         today = now.strftime("%Y-%m-%d")
 
+        # Fast-path: handle simple read intents directly — no LLM call at all
+        # Skip if write intent is present (e.g. "cancel it from my bookings" must not list bookings)
+        if not pending and not _WRITE_INTENT_RE.search(_speech_only):
+            direct = self._try_direct_answer(user_query, today)
+            if direct:
+                logger.info("[Agent] direct-answer fast-path — skipping LLM")
+                return direct
+
+        # LLM DB path: intelligent reads — 1 Gemini call, no tool loop
+        # Only for read queries with no pending state and no write intent
+        if not pending and not _WRITE_INTENT_RE.search(_speech_only):
+            _m = _MEMBER_NAME_RE.search(user_query)
+            _member_name_for_llm = _m.group(1).strip() if _m else None
+            llm_db = self._try_llm_db_answer(_speech_only, member_name=_member_name_for_llm)
+            if llm_db:
+                logger.info("[Agent] LLM-DB path — 1 Gemini call, no ReAct loop")
+                return llm_db
+
         # Build date lookup: past 7 days + today + next 14 days
         # Past days allow the model to resolve booking dates like "March 3rd" that are already in the DB.
         _past_lines = []
@@ -819,6 +1052,45 @@ class MongoDBAgent:
             "EXACT DATE LOOKUP — use these values directly, do NOT recalculate:\n  "
             + "\n  ".join(_past_lines + _this_lines + _next_lines)
         )
+
+        # Pre-fetch DB data for write intents so Gemini can skip query_collection on turn 1
+        _prefetch_context = ""
+        if _WRITE_INTENT_RE.search(_speech_only):
+            _prefetch_parts = []
+            _m_pre = _MEMBER_NAME_RE.search(user_query)
+            _mn_pre = _m_pre.group(1).strip() if _m_pre else None
+            _is_cancel_reschedule = bool(re.search(
+                r'\bcancel\b|\breschedule\b|\bmove\s+my\b|\bchange\s+my\b', _speech_only, re.IGNORECASE
+            ))
+            if _is_cancel_reschedule and _mn_pre and "bookings" in self.collections:
+                data = self._do_query({"collection": "bookings",
+                                       "filter": {"member_name": _mn_pre, "booking_date": {"$gte": today}},
+                                       "limit": 20})
+                if data.get("results"):
+                    _prefetch_parts.append(
+                        f"Collection 'bookings':\n{json.dumps(data['results'], indent=2, default=str)}"
+                    )
+            else:
+                if "classes" in self.collections:
+                    data = self._do_query({"collection": "classes", "filter": {}, "limit": 20})
+                    if data.get("results"):
+                        clean = [{k: v for k, v in r.items() if k not in ("_id", "created_at", "source")}
+                                 for r in data["results"]]
+                        _prefetch_parts.append(f"Collection 'classes':\n{json.dumps(clean, indent=2)}")
+                if "facilities" in self.collections:
+                    data = self._do_query({"collection": "facilities", "filter": {}, "limit": 20})
+                    if data.get("results"):
+                        clean = [{k: v for k, v in r.items() if k not in ("_id", "created_at", "source")}
+                                 for r in data["results"]]
+                        _prefetch_parts.append(f"Collection 'facilities':\n{json.dumps(clean, indent=2)}")
+            if _prefetch_parts:
+                _prefetch_context = (
+                    "\n\nPRE-FETCHED DATA (already loaded — MANDATORY: do NOT call query_collection "
+                    "for any collection listed below; use this data directly to proceed):\n"
+                    + "\n\n".join(_prefetch_parts)
+                )
+                _fetched_names = [p.split("'")[1] for p in _prefetch_parts if "'" in p]
+                logger.info(f"[Agent] prefetched {_fetched_names}")
 
         system = (
             f"You are a voice assistant for {self.schema_desc or 'a business'}. "
@@ -1046,6 +1318,8 @@ class MongoDBAgent:
             "If you are unsure what the user wants, ask for clarification.\n"
             "- Respond naturally for voice: no markdown, no bullet points"
         )
+        if _prefetch_context:
+            system += _prefetch_context
 
         contents = []
         if history:

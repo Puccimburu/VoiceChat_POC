@@ -5,6 +5,30 @@ _GREETING_WORDS = frozenset({
     "thanks", "thank", "bye", "goodbye", "ok", "okay", "cool",
 })
 
+_GREETING_REPLIES = [
+    "Hi! How can I help you today?",
+    "Hello! What can I do for you?",
+    "Hey! How can I help?",
+]
+_THANKS_REPLIES = [
+    "You're welcome! Is there anything else I can help with?",
+    "Happy to help! Anything else I can do for you?",
+]
+_BYE_REPLIES = [
+    "Goodbye! Have a great day!",
+    "Take care! See you next time.",
+    "Bye! Have a wonderful day!",
+]
+
+
+def pick_greeting_reply(transcript: str) -> str:
+    words = set(w.strip(".,!? ") for w in transcript.lower().split())
+    if words & {"bye", "goodbye"}:
+        return random.choice(_BYE_REPLIES)
+    if words & {"thanks", "thank"}:
+        return random.choice(_THANKS_REPLIES)
+    return random.choice(_GREETING_REPLIES)
+
 
 def is_short_greeting(transcript: str) -> bool:
     words = transcript.lower().split()

@@ -5,9 +5,33 @@ import threading
 import time
 from typing import Optional
 
+import grpc
+import google.auth
+import google.auth.transport.requests
+import google.auth.transport.grpc as google_auth_grpc
 from google.cloud import speech as gcp_speech
+from google.cloud.speech_v1.services.speech.transports.grpc import SpeechGrpcTransport
 
 logger = logging.getLogger("ws_gateway")
+
+_KEEPALIVE_OPTIONS = (
+    ('grpc.keepalive_time_ms', 30000),
+    ('grpc.keepalive_timeout_ms', 5000),
+    ('grpc.keepalive_permit_without_calls', 1),
+    ('grpc.http2.max_pings_without_data', 0),
+)
+
+def _build_stt_client() -> gcp_speech.SpeechClient:
+    creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+    channel = google_auth_grpc.secure_authorized_channel(
+        creds,
+        google.auth.transport.requests.Request(),
+        'speech.googleapis.com:443',
+        options=_KEEPALIVE_OPTIONS,
+    )
+    return gcp_speech.SpeechClient(transport=SpeechGrpcTransport(channel=channel))
+
+_stt_client = _build_stt_client()
 
 _STT_MAX_RETRIES = 3
 _STT_RETRY_DELAY = 0.2  # seconds before retry
@@ -86,11 +110,12 @@ class STTSession:
     def _run(self):
         transcript = ""
         attempt    = 0
+        stt_client = _stt_client  # start with the shared cached client
 
         while attempt <= _STT_MAX_RETRIES and not self._stop.is_set():
             try:
                 gen = self._audio_generator() if attempt == 0 else self._retry_generator()
-                for resp in gcp_speech.SpeechClient().streaming_recognize(
+                for resp in stt_client.streaming_recognize(
                     self._make_stt_config(), gen
                 ):
                     if self._stop.is_set():
@@ -111,10 +136,16 @@ class STTSession:
                 logger.error(f"[STT] error (attempt {attempt + 1}): {e}")
                 attempt += 1
                 if attempt <= _STT_MAX_RETRIES:
+                    err_str = str(e).upper()
+                    is_channel_error = any(p in err_str for p in ("MAC", "SSL", "CORRUPT", "MALORDERED", "RECORD"))
                     logger.info(
                         f"[STT] transient error — retrying in {_STT_RETRY_DELAY}s "
                         f"({len(self._audio_buf)} chunks buffered)"
                     )
+                    if is_channel_error:
+                        # SSL/channel corruption — must use a fresh gRPC channel,
+                        # otherwise the next stream gets "Malordered Data".
+                        stt_client = _build_stt_client()
                     time.sleep(_STT_RETRY_DELAY)
                 else:
                     logger.error("[STT] giving up after retry")

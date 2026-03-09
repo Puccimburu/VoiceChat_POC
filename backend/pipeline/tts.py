@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from .base import _executor, _SENTINEL
 from services.tts_service import synthesize_sentence_with_timing
@@ -30,12 +31,14 @@ async def run_ordering_worker(
     results_q: asyncio.Queue,
     send_audio_chunk,
     stop_event: asyncio.Event,
+    t0: float = None,
 ):
     """Emit TTS results in ascending num order. Filler (num=0) only before first real sentence."""
     pending: dict = {}
     next_to_emit       = 1
     filler_emitted     = False
     first_real_arrived = False
+    first_audio_sent   = False
 
     while True:
         if stop_event.is_set():
@@ -54,6 +57,9 @@ async def run_ordering_worker(
             if not first_real_arrived and not filler_emitted:
                 await send_audio_chunk(text, audio, words)
                 filler_emitted = True
+                if not first_audio_sent and t0 is not None:
+                    logger.info(f"[TIMING] first audio (filler) sent: {(time.monotonic()-t0)*1000:.0f}ms since transcript")
+                    first_audio_sent = True
             continue
 
         if num == 1:
@@ -65,4 +71,7 @@ async def run_ordering_worker(
                 return
             t, a, w = pending.pop(next_to_emit)
             await send_audio_chunk(t, a, w)
+            if not first_audio_sent and t0 is not None:
+                logger.info(f"[TIMING] first audio (real) sent: {(time.monotonic()-t0)*1000:.0f}ms since transcript")
+                first_audio_sent = True
             next_to_emit += 1

@@ -17,6 +17,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from functools import wraps
 from typing import Optional
@@ -45,7 +46,7 @@ from services.tts_service            import synthesize_sentence_with_timing
 from pipeline.base                   import _executor, _SENTINEL
 from pipeline.stt                    import STTSession
 from pipeline.llm                    import run_llm_pipeline
-from pipeline.agent                  import run_agent_pipeline
+from pipeline.agent                  import run_agent_pipeline, prewarm_connections
 from pipeline.tts                    import dispatch_tts, run_ordering_worker
 from pipeline.helpers                import is_short_greeting
 from config                          import PLATFORM_MONGO_URI, PLATFORM_DB
@@ -541,6 +542,7 @@ class ClientState:
             # before "Hello! How can I help?" sounds odd.
             if is_short_greeting(transcript):
                 _filler_ok[0] = False
+            t0 = time.monotonic()
             logger.info(f"[ws] [{session_id[:8]}] transcript: {transcript!r}")
             if mode == "agent":
                 await run_agent_pipeline(
@@ -551,6 +553,7 @@ class ClientState:
                     selected_member=selected_member,
                     _results_q=results_q,
                     _ordering_task=ordering_task,
+                    _t0=t0,
                 )
             else:
                 await run_llm_pipeline(
@@ -705,4 +708,5 @@ def _build_widget():
 
 if __name__ == "__main__":
     _build_widget()
+    prewarm_connections()
     asyncio.run(main())
