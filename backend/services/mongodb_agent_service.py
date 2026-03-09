@@ -4,9 +4,29 @@ import logging
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 logger = logging.getLogger("ws_gateway")
+
+# ── Redis LLM-DB answer cache ───────────────────────────────────────────────
+_LLM_DB_CACHE_TTL = 3600  # seconds — classes/facilities rarely change mid-session
+
+def _llm_db_cache_get(db_key: str, speech: str) -> str | None:
+    try:
+        from services.session_service import _get_redis
+        key = f"llmdb:{db_key}:{speech.lower().strip()}"
+        return _get_redis().get(key)
+    except Exception:
+        return None
+
+def _llm_db_cache_set(db_key: str, speech: str, answer: str):
+    try:
+        from services.session_service import _get_redis
+        key = f"llmdb:{db_key}:{speech.lower().strip()}"
+        _get_redis().setex(key, _LLM_DB_CACHE_TTL, answer)
+    except Exception:
+        pass
 
 # ── Pre-fetch intent detection ─────────────────────────────────────────────
 _BOOKINGS_READ_RE = re.compile(
@@ -16,7 +36,7 @@ _BOOKINGS_READ_RE = re.compile(
     r"|what\s+(?:are\s+)?my\s+bookings?"
     r"|how\s+many\s+bookings?"
     r"|which\s+bookings?\s+(?:do\s+i|have\s+i)"
-    r"|do\s+i\s+have\s+(?:any\s+)?bookings?"
+    r"|do\s+i\s+have\s+(?:any\s+|a\s+)?bookings?"
     r"|my\s+(?:upcoming\s+|current\s+|existing\s+)?bookings?"
     r"|what\s+have\s+i\s+booked"
     r"|what'?s\s+booked\s+for\s+me"
@@ -56,12 +76,19 @@ _WRITE_INTENT_RE = re.compile(
 # Topic detectors for LLM DB collection routing
 _CLASSES_TOPIC_RE    = re.compile(r'\bclass(?:es)?\b|\binstructor\b|\bsession\b|\bspots?\b', re.IGNORECASE)
 _FACILITIES_TOPIC_RE = re.compile(r'\bfacilit|\bcourt\b|\bpool\b|\bgym\b|\broom\b|\bhall\b|\bstudio\b', re.IGNORECASE)
+# Cost queries must go to LLM DB (has amount field) — skip Direct DB which can't calculate totals
+_COST_QUERY_RE = re.compile(r'\b(?:cost|price|fee|amount|total|how\s+much)\b', re.IGNORECASE)
 # Softer "my bookings" topic — catches phrasings not covered by _BOOKINGS_READ_RE Direct-DB path
 _MY_BOOKINGS_TOPIC_RE = re.compile(
     r'\bmy\s+(?:upcoming\s+)?(?:bookings?|sessions?|appointments?|reservations?|schedule)\b'
     r'|\bbookings?\s+i\s+(?:have|made|got)\b'
-    r'|\bwhat\s+(?:have\s+i|am\s+i)\s+booked\b'
-    r'|\bwhat\s+(?:do\s+i\s+have|is\s+(?:on\s+)?my\s+schedule)\b',
+    r'|\bwhat\s+(?:have\s+i|am\s+i)\s+(?:booked|bookings?)\b'
+    r'|\bwhat\s+(?:do\s+i\s+have|is\s+(?:on\s+)?my\s+schedule)\b'
+    r'|\b(?:cost|price|fee|amount|total|how\s+much).*\bmy\s+bookings?\b'
+    r'|\bmy\s+bookings?.*\b(?:cost|price|fee|amount|total)\b'
+    r'|\bmy\b.*\b(?:cost|price|fee|amount|total)\b.*\bbookings?\b'
+    r'|\bmy\b.*\bbookings?\b.*\b(?:cost|price|fee|amount|total)\b'
+    r'|\b(?:all|five|the)\s+bookings?\b',
     re.IGNORECASE,
 )
 
@@ -79,6 +106,38 @@ _schema_store:      dict = {}
 _collections_cache: dict = {}
 MAX_LOOP     = 10
 _MAX_RETRIES = 4
+
+
+def _gemini_stream_content(client, contents, config, on_text_chunk, model="gemini-2.5-flash-lite"):
+    """Stream Gemini, calling on_text_chunk(str) for each text piece as it arrives.
+    Returns assembled model_content (text + any function_call parts).
+    Falls back to _gemini_call if the stream fails before any text is emitted."""
+    all_text = ""
+    fc_parts  = []
+    emitted   = False
+    try:
+        for chunk in client.models.generate_content_stream(
+            model=model, contents=contents, config=config
+        ):
+            if not chunk.candidates:
+                continue
+            for p in (chunk.candidates[0].content.parts or []):
+                if hasattr(p, "function_call") and p.function_call:
+                    fc_parts.append(p)
+                elif hasattr(p, "text") and p.text:
+                    all_text += p.text
+                    on_text_chunk(p.text)
+                    emitted = True
+        merged = ([types.Part(text=all_text)] if all_text else []) + fc_parts
+        return types.Content(role="model", parts=merged)
+    except Exception as e:
+        if not emitted:
+            logger.warning(f"[Agent] stream failed before emission, falling back: {e}")
+            resp = _gemini_call(client, contents, config)
+            return resp.candidates[0].content
+        logger.warning(f"[Agent] stream interrupted mid-response: {e}")
+        return types.Content(role="model",
+                             parts=([types.Part(text=all_text)] if all_text else []) + fc_parts)
 
 
 def _gemini_call(client, contents, config, model="gemini-2.5-flash-lite"):
@@ -256,16 +315,19 @@ class MongoDBAgent:
 
         return ""
 
-    def _try_llm_db_answer(self, speech: str, member_name: str = None) -> str:
+    def _try_llm_db_answer(self, speech: str, member_name: str = None,
+                           on_sentence=None, _start_num: int = 1) -> str:
         """Fetch relevant MongoDB data and answer with a single Gemini call (no ReAct loop).
         Returns '' to fall through to the ReAct loop if no data found or on error."""
         # Route to relevant collections based on query topic
         to_fetch = []
         booking_filter = None
+        is_personal_booking_query = False
         if _MY_BOOKINGS_TOPIC_RE.search(speech) and member_name and "bookings" in self.collections:
             today = datetime.utcnow().strftime("%Y-%m-%d")
             booking_filter = {"member_name": member_name, "booking_date": {"$gte": today}}
             to_fetch.append("bookings")
+            is_personal_booking_query = True
         if _CLASSES_TOPIC_RE.search(speech):
             to_fetch.append("classes")
         if _FACILITIES_TOPIC_RE.search(speech):
@@ -276,20 +338,49 @@ class MongoDBAgent:
             skip = _BLOCKED | {"bookings", "members"}
             to_fetch = [c for c in self.collections if c not in skip]
 
-        context_parts = []
-        for col in to_fetch:
-            if col not in self.collections:
-                continue
+        # Redis cache — skip for personal booking queries (member-specific, must be fresh)
+        db_key = self._cache_key
+        if not is_personal_booking_query:
+            cached = _llm_db_cache_get(db_key, speech)
+            if cached:
+                logger.info(f"[Agent] LLM-DB cache hit for: {speech[:60]!r}")
+                return cached
+
+        # Fetch all collections in parallel
+        def _fetch(col):
             filt = booking_filter if (col == "bookings" and booking_filter) else {}
-            data = self._do_query({"collection": col, "filter": filt, "limit": 20})
-            results = data.get("results", [])
-            if results:
-                # Strip internal system fields to keep context clean and token-efficient
-                clean = [
-                    {k: v for k, v in r.items() if k not in ("_id", "created_at", "source", "status")}
-                    for r in results
-                ]
-                context_parts.append(f"Collection '{col}':\n{json.dumps(clean, indent=2)}")
+            return col, self._do_query({"collection": col, "filter": filt, "limit": 20})
+
+        cols_to_fetch = [c for c in to_fetch if c in self.collections]
+        context_parts = []
+        def _build_context_part(col, results):
+            if not results:
+                return
+            clean = [
+                {k: v for k, v in r.items() if k not in ("_id", "created_at", "source", "status")}
+                for r in results
+            ]
+            part = f"Collection '{col}':\n{json.dumps(clean, indent=2)}"
+            # Pre-compute total for personal booking queries so Gemini doesn't have to add
+            if col == "bookings" and is_personal_booking_query:
+                total = sum(r.get("amount", 0) for r in results if isinstance(r.get("amount"), (int, float)))
+                if total > 0:
+                    part += f"\nPRE-COMPUTED TOTAL COST: {total}"
+            context_parts.append(part)
+
+        if len(cols_to_fetch) > 1:
+            with ThreadPoolExecutor(max_workers=len(cols_to_fetch)) as pool:
+                futures = {pool.submit(_fetch, col): col for col in cols_to_fetch}
+                results_map = {}
+                for fut in as_completed(futures):
+                    col, data = fut.result()
+                    results_map[col] = data
+            for col in cols_to_fetch:
+                _build_context_part(col, results_map[col].get("results", []))
+        else:
+            for col in cols_to_fetch:
+                data = self._do_query({"collection": col, "filter": booking_filter or {}, "limit": 20})
+                _build_context_part(col, data.get("results", []))
 
         if not context_parts:
             return ""
@@ -303,14 +394,39 @@ class MongoDBAgent:
             f"QUESTION: {speech}"
         )
         try:
-            response = _gemini_call(
-                self.gemini,
-                prompt,
-                types.GenerateContentConfig(temperature=0.1),
-            )
-            parts = (response.candidates[0].content.parts or []) if response.candidates else []
-            text = "".join(p.text for p in parts if hasattr(p, "text") and p.text).strip()
+            cfg = types.GenerateContentConfig(temperature=0.1)
+            if on_sentence is not None:
+                from pipeline.helpers import extract_sentences
+                _buf = [""]
+                _num = [_start_num]
+                _all = [""]
+
+                def _on_chunk(chunk):
+                    _buf[0] += chunk
+                    _all[0] += chunk
+                    while True:
+                        sentences, remaining = extract_sentences(_buf[0])
+                        if not sentences:
+                            _buf[0] = remaining
+                            break
+                        for s in sentences:
+                            if s.strip():
+                                on_sentence(s, _num[0])
+                                _num[0] += 1
+                        _buf[0] = remaining
+
+                _gemini_stream_content(self.gemini, prompt, cfg, _on_chunk)
+                if _buf[0].strip():
+                    on_sentence(_buf[0].strip(), _num[0])
+                text = _all[0].strip()
+            else:
+                response = _gemini_call(self.gemini, prompt, cfg)
+                parts = (response.candidates[0].content.parts or []) if response.candidates else []
+                text = "".join(p.text for p in parts if hasattr(p, "text") and p.text).strip()
+
             logger.info(f"[Agent] LLM-DB answer for: {speech[:60]!r}")
+            if text and not is_personal_booking_query:
+                _llm_db_cache_set(db_key, speech, text)
             return text
         except Exception as e:
             logger.error(f"[Agent] LLM-DB error: {e}")
@@ -942,15 +1058,17 @@ class MongoDBAgent:
         t = text.strip().lower().rstrip(".,!?")
         if t in MongoDBAgent._YES_PHRASES:
             return True
-        # Remove internal punctuation (commas, semicolons) so "yes, go ahead" → "yes go ahead"
-        t_clean = t.replace(",", "").replace(";", "").strip()
+        # Strip all internal punctuation so "yes. proceed" / "yes, go ahead" → "yes proceed"
+        import re as _re
+        t_clean = _re.sub(r'[^\w\s]', '', t).strip()
         if t_clean in MongoDBAgent._YES_PHRASES:
             return True
-        # "yes please", "yes go ahead", "yes do it" — short yes-prefixed phrases
+        # "yes please", "yes go ahead", "yes do it", "yes proceed" — short yes-prefixed phrases
         words = t_clean.split()
         return bool(words) and words[0] == "yes" and len(words) <= 3
 
-    def query(self, user_query: str, history: list = None, pending: dict = None) -> str:
+    def query(self, user_query: str, history: list = None, pending: dict = None,
+              on_sentence=None, _start_num: int = 1) -> str:
         self._next_pending             = None
         self._last_queried_for_booking = None
         self._last_class_result        = None
@@ -1005,8 +1123,8 @@ class MongoDBAgent:
         today = now.strftime("%Y-%m-%d")
 
         # Fast-path: handle simple read intents directly — no LLM call at all
-        # Skip if write intent is present (e.g. "cancel it from my bookings" must not list bookings)
-        if not pending and not _WRITE_INTENT_RE.search(_speech_only):
+        # Skip if write intent or cost query present (cost queries need LLM DB to calculate totals)
+        if not pending and not _WRITE_INTENT_RE.search(_speech_only) and not _COST_QUERY_RE.search(_speech_only):
             direct = self._try_direct_answer(user_query, today)
             if direct:
                 logger.info("[Agent] direct-answer fast-path — skipping LLM")
@@ -1017,7 +1135,8 @@ class MongoDBAgent:
         if not pending and not _WRITE_INTENT_RE.search(_speech_only):
             _m = _MEMBER_NAME_RE.search(user_query)
             _member_name_for_llm = _m.group(1).strip() if _m else None
-            llm_db = self._try_llm_db_answer(_speech_only, member_name=_member_name_for_llm)
+            llm_db = self._try_llm_db_answer(_speech_only, member_name=_member_name_for_llm,
+                                             on_sentence=on_sentence, _start_num=_start_num)
             if llm_db:
                 logger.info("[Agent] LLM-DB path — 1 Gemini call, no ReAct loop")
                 return llm_db
@@ -1134,13 +1253,15 @@ class MongoDBAgent:
             "     Handle one deletion at a time. Never try to update an existing booking's date instead — "
             "updating does NOT remove the extra bookings.\n"
             "  * JOINING A CLASS — ANY phrasing that means the user wants to attend, join, enrol in, "
-            "book into, or get a spot in a class. Examples: 'enrol me in yoga', 'book for me a slot in yoga', "
-            "'get me a spot in yoga', 'I'd like to join yoga', 'put me in yoga', 'reserve me a place in yoga', "
-            "'sign me up for yoga', 'add me to yoga', 'I want to do yoga'. → go to CLASS BOOKING FLOW.\n"
+            "book into, or get a spot in a named class (yoga, swimming, HIIT, spin cycling, etc.). "
+            "Examples: 'enrol me in yoga', 'book for me a slot in yoga', 'I want to do yoga'. → CLASS BOOKING FLOW. "
+            "EXCEPTION: if the user says 'session at [facility]' or names a facility (gym, court, pool, studio) → FACILITY BOOKING FLOW instead.\n"
             "  * SHORT CLASS REFERENCE — if the user replies with just a class name or short phrase "
             "(e.g. 'swimming', 'the yoga class', 'morning yoga', 'in the swimming class') after you asked "
             "which class they want, treat it as CLASS BOOKING FLOW for that class — do NOT return Sorry.\n"
-            "  * BOOKING A FACILITY — user wants to reserve a facility (court, pool, room, etc.) for a time. "
+            "  * BOOKING A FACILITY — user wants to reserve a facility (court, pool, gym, room, studio, etc.) for a time, "
+            "OR says 'session at [facility]', 'book the [facility]', 'book me a session at the [facility name]'. "
+            "IMPORTANT: if the user mentions a facility name (gym, court, pool, studio) → FACILITY BOOKING FLOW, not CLASS BOOKING FLOW. "
             "→ go to FACILITY BOOKING FLOW.\n"
             "  * CHANGING/RESCHEDULING — user mentions an EXISTING booking and wants to change date/time. "
             "→ go to RESCHEDULING flow.\n"
@@ -1298,10 +1419,12 @@ class MongoDBAgent:
             "- FACILITY BOOKING FLOW (follow every step in order):\n"
             "  1. query_collection('facilities') to confirm the facility exists and is available.\n"
             "  2. You need BOTH a specific date (YYYY-MM-DD) AND a time slot from the user before you can confirm. "
-            "If EITHER is missing, you MUST call the ask_user tool (NOT plain text) to request what is missing. "
+            "If EITHER is missing, you MUST immediately call ask_user (NOT plain text) to request what is missing. "
             "Do NOT default to today's date — if the user gives only a time, ask for the date too. "
-            "Example: ask_user(question='What date would you like? The gym is open 06:00-22:00.', "
-            "collection='bookings', partial_document={...}).\n"
+            "CRITICAL: after step 1 you MUST either call ask_user or confirm_action — never return empty. "
+            "Call ask_user like this: ask_user(question='What date and time would you like to book [facility]? "
+            "It is open [hours].', collection='bookings', "
+            "partial_document={'facility_name': '<name from query>', 'member_name': '<member_name>', 'member_id': '<member_id>'}).\n"
             "  3. Call confirm_action with a summary: facility name, date (written as e.g. Monday March 2nd), "
             "time slot, member name, and rate_per_hour (e.g. 'The rate is 18 rupees per hour').\n"
             "  4. Only after the user confirms, call insert_document into 'bookings' with fields: "
@@ -1395,12 +1518,15 @@ class MongoDBAgent:
             temperature=0.1,
         )
 
-        # ReAct loop
+        # ReAct loop — always uses regular (non-streaming) call to preserve function-call
+        # history fidelity. Streaming is only used for the LLM DB path (text-only responses).
+        _react_sent_num = [_start_num]  # track sentence number for on_sentence dispatching
+
         for i in range(MAX_LOOP):
             print(f"[Agent] Loop {i + 1}")
             response = _gemini_call(self.gemini, contents, config)
-
             model_content = response.candidates[0].content
+
             contents.append(model_content)
 
             parts = model_content.parts or [] if model_content else []
@@ -1441,7 +1567,21 @@ class MongoDBAgent:
                         and any(w in text.lower() for w in self._DATE_TIME_WORDS)):
                     self._next_pending = self._last_queried_for_booking
 
-                return text or "Sorry, I didn't quite catch that. Could you say that again?"
+                final = text or "Sorry, I didn't quite catch that. Could you say that again?"
+                if on_sentence is not None:
+                    from pipeline.helpers import extract_sentences as _es
+                    buf = final
+                    while True:
+                        sentences, buf = _es(buf)
+                        if not sentences:
+                            break
+                        for s in sentences:
+                            if s.strip():
+                                on_sentence(s, _react_sent_num[0])
+                                _react_sent_num[0] += 1
+                    if buf.strip():
+                        on_sentence(buf.strip(), _react_sent_num[0])
+                return final
 
             tool_response_parts = []
             early_return        = None

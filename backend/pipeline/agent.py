@@ -174,6 +174,17 @@ async def run_agent_pipeline(
             ))
         _next_tts_num = 1
 
+    # Streaming: sentences dispatched inline from executor thread via run_coroutine_threadsafe
+    _streaming_futures = []  # concurrent.futures.Future objects
+
+    def _on_sentence(text, num):
+        if stop_event.is_set():
+            return
+        fut = asyncio.run_coroutine_threadsafe(
+            dispatch_tts(text, voice, num, results_q, stop_event), loop
+        )
+        _streaming_futures.append(fut)
+
     def _run_agent():
         _, session_data = get_or_create_session(session_id)
         history  = session_data.get("history", [])[-4:]
@@ -209,7 +220,8 @@ async def run_agent_pipeline(
         response_text = ""
         t_llm = time.monotonic()
         try:
-            response_text = agent.query(query, history=history, pending=pending)
+            response_text = agent.query(query, history=history, pending=pending,
+                                        on_sentence=_on_sentence, _start_num=_next_tts_num)
             logger.info(f"[TIMING] agent.query (DB+LLM): {(time.monotonic()-t_llm)*1000:.0f}ms | total since transcript: {(time.monotonic()-t0)*1000:.0f}ms")
         finally:
             _, sd = get_or_create_session(session_id)
@@ -246,25 +258,33 @@ async def run_agent_pipeline(
         await ordering_task
         return
 
-    sentence_count = _next_tts_num - 1
-    buf = response_text
-    while True:
-        sentences, buf = extract_sentences(buf)
-        if not sentences:
-            break
-        for s in sentences:
-            if s.strip():
-                sentence_count += 1
-                tts_tasks.append(asyncio.create_task(
-                    dispatch_tts(s, voice, sentence_count, results_q, stop_event)
-                ))
-    if buf.strip():
-        sentence_count += 1
-        tts_tasks.append(asyncio.create_task(
-            dispatch_tts(buf, voice, sentence_count, results_q, stop_event)
-        ))
-
-    await asyncio.gather(*tts_tasks, return_exceptions=True)
+    if _streaming_futures:
+        # Sentences were already dispatched inline during streaming — just await them
+        await asyncio.gather(
+            *tts_tasks,  # includes filler (num=0) if dispatched
+            *[asyncio.wrap_future(f) for f in _streaming_futures],
+            return_exceptions=True,
+        )
+    else:
+        # Batch dispatch (non-streaming path: greetings, fast-path, fallback)
+        sentence_count = _next_tts_num - 1
+        buf = response_text
+        while True:
+            sentences, buf = extract_sentences(buf)
+            if not sentences:
+                break
+            for s in sentences:
+                if s.strip():
+                    sentence_count += 1
+                    tts_tasks.append(asyncio.create_task(
+                        dispatch_tts(s, voice, sentence_count, results_q, stop_event)
+                    ))
+        if buf.strip():
+            sentence_count += 1
+            tts_tasks.append(asyncio.create_task(
+                dispatch_tts(buf, voice, sentence_count, results_q, stop_event)
+            ))
+        await asyncio.gather(*tts_tasks, return_exceptions=True)
     logger.info(f"[TIMING] TTS synthesized (first audio imminent): {(time.monotonic()-t0)*1000:.0f}ms since transcript")
     await results_q.put(_SENTINEL)
     await ordering_task
