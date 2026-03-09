@@ -68,7 +68,8 @@ _WRITE_INTENT_RE = re.compile(
     r'\b(?:book\s+me|book\s+for\s+me|enroll\s+me|enrol\s+me|sign\s+me|'
     r'reserve\s+me|get\s+me\s+into|add\s+me\s+to|put\s+me\s+in|'
     r'i\s+want\s+to\s+book|i\s+would\s+like\s+to\s+book|i\'?d\s+like\s+to\s+book|'
-    r'can\s+you\s+book|cancel|reschedule|change\s+my\s+booking|'
+    r'can\s+you\s+book|could\s+you\s+book|would\s+you\s+book|please\s+book|'
+    r'cancel|reschedule|change\s+my\s+booking|'
     r'move\s+my\s+booking|remove\s+my\s+booking|delete\s+my\s+booking)\b',
     re.IGNORECASE,
 )
@@ -314,6 +315,9 @@ class MongoDBAgent:
             return self._format_classes(data.get("results", []))
 
         return ""
+
+    # Pronouns that signal the user is referring to something from the previous turn
+    _PRONOUN_RE = re.compile(r'\b(?:they|them|those|it|these|the\s+ones?)\b', re.IGNORECASE)
 
     def _try_llm_db_answer(self, speech: str, member_name: str = None,
                            on_sentence=None, _start_num: int = 1) -> str:
@@ -1135,7 +1139,14 @@ class MongoDBAgent:
         if not pending and not _WRITE_INTENT_RE.search(_speech_only):
             _m = _MEMBER_NAME_RE.search(user_query)
             _member_name_for_llm = _m.group(1).strip() if _m else None
-            llm_db = self._try_llm_db_answer(_speech_only, member_name=_member_name_for_llm,
+            # Pronoun resolution: if query has "they/them/it" and last response mentioned bookings,
+            # rewrite the query in Python before routing — zero LLM token overhead
+            _llm_speech = _speech_only
+            if MongoDBAgent._PRONOUN_RE.search(_speech_only):
+                _last_assistant = (history[-1].get("assistant", "") if history else "")
+                if "booking" in _last_assistant.lower():
+                    _llm_speech = MongoDBAgent._PRONOUN_RE.sub("my bookings", _speech_only)
+            llm_db = self._try_llm_db_answer(_llm_speech, member_name=_member_name_for_llm,
                                              on_sentence=on_sentence, _start_num=_start_num)
             if llm_db:
                 logger.info("[Agent] LLM-DB path — 1 Gemini call, no ReAct loop")
