@@ -152,40 +152,6 @@ def voice_search(query, top_k=64, document_filter=None):
                 raise
 
 # ---------------------------------------------------------------------------
-# Create / recreate collection
-# ---------------------------------------------------------------------------
-def create_voice_collection():
-    """Creates the collection if it doesn't already exist."""
-    client = get_qdrant_client()
-    try:
-        client.create_collection(
-            collection_name=QDRANT_COLLECTION_NAME,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-        )
-        print(f"Collection '{QDRANT_COLLECTION_NAME}' created successfully.")
-    except Exception as e:
-        print(f"Collection '{QDRANT_COLLECTION_NAME}' already exists or error: {e}")
-    info = client.get_collection(QDRANT_COLLECTION_NAME)
-    print(f"'{QDRANT_COLLECTION_NAME}': {info.points_count} points, vector size: {info.config.params.vectors.size}")
-    return info
-
-def recreate_voice_collection():
-    """Delete and recreate collection with 768-dim vectors for Gemini embeddings."""
-    client = get_qdrant_client()
-    try:
-        client.delete_collection(collection_name=QDRANT_COLLECTION_NAME)
-        print(f"Deleted old collection '{QDRANT_COLLECTION_NAME}'")
-    except Exception as e:
-        print(f"Could not delete collection: {e}")
-    client.create_collection(
-        collection_name=QDRANT_COLLECTION_NAME,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-    )
-    info = client.get_collection(QDRANT_COLLECTION_NAME)
-    print(f"Recreated '{QDRANT_COLLECTION_NAME}': vector size {info.config.params.vectors.size}")
-    return info
-
-# ---------------------------------------------------------------------------
 # Get list of documents in collection
 # ---------------------------------------------------------------------------
 def get_document_list():

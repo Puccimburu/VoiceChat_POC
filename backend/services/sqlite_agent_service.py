@@ -1,6 +1,5 @@
 """SQLite Query Agent — agentic: Gemini function calling + ReAct loop."""
 import json
-import random
 import time
 import sqlite3
 from datetime import datetime
@@ -8,36 +7,12 @@ from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY
 
+from constants import MAX_LOOP, SCHEMA_TTL
+from services.gemini_client import gemini_call as _gemini_call
+
 _gemini      = genai.Client(api_key=GEMINI_API_KEY)
-_SCHEMA_TTL  = 300
+_SCHEMA_TTL  = SCHEMA_TTL
 _schema_store: dict = {}
-MAX_LOOP     = 10
-_MAX_RETRIES = 4
-
-
-def _gemini_call(client, contents, config, model="gemini-2.5-flash-lite"):
-    """Call Gemini with exponential backoff on transient errors (503, SSL corruption)."""
-    for attempt in range(_MAX_RETRIES):
-        try:
-            return client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
-        except Exception as e:
-            msg = str(e)
-            is_retryable = (
-                "503" in msg
-                or "UNAVAILABLE" in msg
-                or "overload" in msg.lower()
-                or "SSLV3" in msg
-                or "BAD_RECORD_MAC" in msg
-                or "SSL" in msg
-            )
-            if is_retryable and attempt < _MAX_RETRIES - 1:
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                print(f"[Gemini] transient error ({msg[:60]}), retry {attempt + 1}/{_MAX_RETRIES - 1} in {wait:.1f}s")
-                time.sleep(wait)
-            else:
-                raise
 
 
 class SQLiteAgent:

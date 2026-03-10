@@ -228,7 +228,7 @@ function AppStreaming() {
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          autoGainControl: false,
           sampleRate: 48000,
           channelCount: 1
         }
@@ -306,9 +306,9 @@ function AppStreaming() {
         stream,
         workletURL: '/vad.worklet.bundle.min.js',
         modelURL: '/silero_vad_v5.onnx',
-        positiveSpeechThreshold: 0.5,
+        positiveSpeechThreshold: 0.7,
         negativeSpeechThreshold: 0.35,
-        minSpeechFrames: 3,
+        minSpeechFrames: 6,
         redemptionFrames: 8,
         onSpeechStart: () => {
           const now = Date.now();

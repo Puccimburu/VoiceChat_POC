@@ -116,10 +116,6 @@ def save_session(session_id: str, session_data: dict):
     _save(session_id, session_data)
 
 
-# ---------------------------------------------------------------------------
-# Prompt builders (stateless — take session_data dict, return string)
-# ---------------------------------------------------------------------------
-
 def build_context_prompt(session_data: dict, current_message: str) -> str:
     """Build Gemini prompt with conversation history."""
     if not session_data['history']:
@@ -135,6 +131,8 @@ def build_context_prompt(session_data: dict, current_message: str) -> str:
 
     history_text += f"Current question: {current_message}"
     return history_text
+
+
 
 
 def build_rag_prompt(session_data: dict, current_message: str, qdrant_results: list) -> str:
