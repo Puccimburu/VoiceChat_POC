@@ -54,7 +54,9 @@ def agent_query():
     return_audio = data.get("return_audio", False)
     voice        = data.get("voice", "en-US-Neural2-J")
     history      = data.get("history")
+    history      = history if isinstance(history, list) else None
     pending      = data.get("pending")
+    pending      = pending if isinstance(pending, dict) else None
     if not query:
         return jsonify({"error": "query is required"}), 400
     try:

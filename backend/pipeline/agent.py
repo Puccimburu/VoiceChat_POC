@@ -177,6 +177,7 @@ async def run_agent_pipeline(
                 "Done.",
                 "I wasn't able to complete that request. Please try again.",
                 "Sorry, I didn't quite catch that. Could you say that again?",
+                "I'm sorry, I'm having trouble connecting right now. Please try again in a moment.",
             }
             if response_text and response_text.strip() not in _skip:
                 add_to_conversation_history(session_id, transcript, response_text)
@@ -187,9 +188,11 @@ async def run_agent_pipeline(
         response_text = await loop.run_in_executor(_executor, _run_agent)
     except Exception as e:
         logger.error(f"[Agent] query error: {e}")
-        await send_error(f"Agent error: {e}")
+        _fallback = "I'm sorry, I'm having trouble right now. Please try again."
+        await dispatch_tts(_fallback, voice, 1, results_q, stop_event)
         await results_q.put(_SENTINEL)
         await ordering_task
+        await send_conv_pair(transcript, _fallback)
         await send_complete()
         return
 

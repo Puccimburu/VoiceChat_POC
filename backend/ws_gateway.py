@@ -19,6 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
+# gRPC environment workarounds - MUST be set before any gRPC imports
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
+os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
+
 try:
     import websockets
 except ImportError:

@@ -185,7 +185,11 @@ class ClientState:
                 dispatch_tts(random.choice(_EARLY_FILLERS), voice, 0, results_q, stop_event, _allowed=_filler_ok)
             )
 
-            transcript = await stt._transcript_future
+            try:
+                transcript = await asyncio.wait_for(stt._transcript_future, timeout=20.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[ws] [{session_id[:8]}] STT future timed out after 20 s — treating as empty transcript")
+                transcript = ""
             if not transcript or not transcript.strip():
                 logger.info(f"[ws] [{session_id[:8]}] empty transcript")
                 _filler_ok[0] = False

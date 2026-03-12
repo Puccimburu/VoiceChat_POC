@@ -252,7 +252,7 @@ class AgentRoutingMixin:
             return text
         except Exception as e:
             logger.error(f"[Agent] LLM-DB error: {e}")
-            return ""
+            return "I'm sorry, I'm having trouble connecting right now. Please try again in a moment."
 
     # ── Prefetch write data ──────────────────────────────────────────────
 
