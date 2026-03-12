@@ -10,6 +10,7 @@ from typing import Optional
 import websockets.exceptions
 
 from services.security_service  import check_origin_allowed
+from config                     import API_KEY
 from services.session_service   import get_or_create_session
 from services.qdrant_service    import get_document_list
 from pipeline.base              import _executor, _SENTINEL
@@ -34,7 +35,6 @@ class ClientState:
         self.ws              = ws
         self.origin          = origin
         self.authorized      = False
-        self.api_key         = ""
         self.session_id      = ""
         self.voice           = "en-US-Neural2-J"
         self.mode            = "general"
@@ -108,24 +108,19 @@ class ClientState:
         else:                             await self.send("echo", msg)
 
     async def _handle_auth(self, data: dict):
-        api_key = data.get("api_key", "")
-        if not api_key:
-            await self.send_error("auth must include api_key")
+        if API_KEY and data.get("api_key") != API_KEY:
+            await self.send_error("auth failed: invalid API key")
             return
-        loop    = asyncio.get_event_loop()
-        allowed = await loop.run_in_executor(
-            _executor, lambda: check_origin_allowed(api_key, self.origin)
-        )
-        if not allowed:
+        if not check_origin_allowed(self.origin):
             await self.send_error("auth failed: origin not allowed")
             return
+        loop = asyncio.get_event_loop()
         session_id, _ = await loop.run_in_executor(
             _executor, lambda: get_or_create_session(data.get("session_id") or None)
         )
-        self.api_key    = api_key
         self.session_id = session_id
         self.authorized = True
-        logger.info(f"[ws] authenticated api_key={api_key!r} session={session_id}")
+        logger.info(f"[ws] authenticated session={session_id}")
         await self.send("connected", {"status": "ready", "session_id": session_id})
 
     async def _handle_get_documents(self):
@@ -171,7 +166,6 @@ class ClientState:
 
         stop_event      = self._new_stop_event()
         session_id      = self.session_id
-        api_key         = self.api_key
         voice           = self.voice
         mode            = self.mode
         selected_doc    = self.selected_doc
@@ -207,7 +201,7 @@ class ClientState:
             logger.info(f"[ws] [{session_id[:8]}] transcript: {transcript!r}")
             if mode == "agent":
                 await run_agent_pipeline(
-                    transcript, session_id, api_key, voice,
+                    transcript, session_id, voice,
                     self.send_audio_chunk, self.send_conv_pair,
                     self.send_complete, self.send_error,
                     stop_event,

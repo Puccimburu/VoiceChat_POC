@@ -1,6 +1,7 @@
 """MongoDBAgent — main class combining all mixins."""
 import logging
 import re
+import threading
 import time
 
 from pymongo import MongoClient
@@ -8,7 +9,7 @@ from google import genai
 from google.genai import types
 
 from constants import SCHEMA_TTL, COLLECTIONS_TTL
-from config import GEMINI_API_KEY, PLATFORM_MONGO_URI, PLATFORM_DB
+from config import GEMINI_API_KEY, MONGO_URI, MONGO_DB
 from pipeline.helpers import extract_sentences as _extract_sentences
 from services.gemini_client import gemini_call as _gemini_call
 
@@ -26,6 +27,7 @@ _gemini            = genai.Client(api_key=GEMINI_API_KEY)
 _BLOCKED           = {"admin", "api_keys", "customers"}
 _SCHEMA_TTL        = SCHEMA_TTL
 _COLLECTIONS_TTL   = COLLECTIONS_TTL
+_schema_lock:       threading.Lock = threading.Lock()
 _schema_store:      dict = {}
 _collections_cache: dict = {}
 
@@ -35,8 +37,8 @@ class MongoDBAgent(AgentRoutingMixin, AgentCrudMixin, AgentToolsMixin, AgentProm
     def __init__(self, db_config: dict = None, mongo_client: MongoClient = None):
         self.gemini       = _gemini
         cfg               = db_config or {}
-        conn_str          = cfg.get("connection_string", PLATFORM_MONGO_URI)
-        db_name           = cfg.get("database", PLATFORM_DB)
+        conn_str          = cfg.get("connection_string", MONGO_URI)
+        db_name           = cfg.get("database", MONGO_DB)
         self.schema_desc  = cfg.get("schema_description", "")
         cols              = cfg.get("collections", [])
         # Accept a pre-built client so callers can share connection pools across tenants
@@ -44,12 +46,16 @@ class MongoDBAgent(AgentRoutingMixin, AgentCrudMixin, AgentToolsMixin, AgentProm
         self.db           = self.mongo_client[db_name]
         self._cache_key   = (conn_str, db_name)
         if not cols:
-            entry = _collections_cache.get(self._cache_key)
-            if entry and (time.time() - entry["ts"]) < _COLLECTIONS_TTL:
-                cols = entry["cols"]
-            else:
+            with _schema_lock:
+                entry = _collections_cache.get(self._cache_key)
+                if entry and (time.time() - entry["ts"]) < _COLLECTIONS_TTL:
+                    cols = entry["cols"]
+                else:
+                    cols = None  # fetch outside the lock
+            if cols is None:
                 cols = [c for c in self.db.list_collection_names() if c not in _BLOCKED]
-                _collections_cache[self._cache_key] = {"cols": cols, "ts": time.time()}
+                with _schema_lock:
+                    _collections_cache[self._cache_key] = {"cols": cols, "ts": time.time()}
         self.collections  = cols
         self._tools                    = self._build_tools()
         self._next_pending             = None
@@ -60,9 +66,11 @@ class MongoDBAgent(AgentRoutingMixin, AgentCrudMixin, AgentToolsMixin, AgentProm
     # ── Schema ───────────────────────────────────────────────────────────
 
     def _schema(self) -> str:
-        entry = _schema_store.get(self._cache_key)
-        if entry and (time.time() - entry["ts"]) < _SCHEMA_TTL:
-            return entry["schema"]
+        with _schema_lock:
+            entry = _schema_store.get(self._cache_key)
+            if entry and (time.time() - entry["ts"]) < _SCHEMA_TTL:
+                return entry["schema"]
+        # Fetch from DB outside the lock — this is the slow path
         parts = []
         for col in self.collections:
             samples = list(self.db[col].find({}, {"_id": 0}).limit(3))
@@ -75,12 +83,14 @@ class MongoDBAgent(AgentRoutingMixin, AgentCrudMixin, AgentToolsMixin, AgentProm
             parts.append(f"  - {col}: fields={fields}" + (f", values={vals}" if vals else ""))
         base   = "Collections:\n" + "\n".join(parts)
         schema = f"{self.schema_desc}\n\n{base}" if self.schema_desc else base
-        _schema_store[self._cache_key] = {"schema": schema, "ts": time.time()}
+        with _schema_lock:
+            _schema_store[self._cache_key] = {"schema": schema, "ts": time.time()}
         return schema
 
     def _invalidate_schema(self):
-        _schema_store.pop(self._cache_key, None)
-        _collections_cache.pop(self._cache_key, None)
+        with _schema_lock:
+            _schema_store.pop(self._cache_key, None)
+            _collections_cache.pop(self._cache_key, None)
 
     # ── Class-level constants ─────────────────────────────────────────────
 

@@ -8,10 +8,6 @@ load_dotenv()
 # API Keys
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Platform database (stores customers, API keys, db configs)
-PLATFORM_MONGO_URI = os.environ.get("PLATFORM_MONGO_URI", "mongodb+srv://execouser:kvBCLWs1xRSHNq6M@ac-vtaexoy.mftcjhw.mongodb.net/genaiexeco-devlocal?authSource=admin")
-PLATFORM_DB        = os.environ.get("PLATFORM_DB", "Test")
-
 # Session Configuration
 SESSION_TIMEOUT = 24 * 60 * 60  # 24 hours in seconds
 MAX_HISTORY = 5  # Keep last 5 conversation exchanges
@@ -37,6 +33,13 @@ GEMINI_SYSTEM_INSTRUCTION = (
 TTS_SAMPLE_RATE = 24000
 TTS_SPEAKING_RATE = 1.1
 MALE_VOICES = ['en-US-Neural2-A', 'en-US-Neural2-D', 'en-US-Neural2-I', 'en-US-Neural2-J']
+
+# Single-tenant DB + auth
+DB_TYPE         = os.getenv("DB_TYPE",  "mongodb")
+MONGO_URI       = os.getenv("MONGO_URI", "db string here")
+MONGO_DB        = os.getenv("MONGO_DB",  "Test")
+API_KEY         = os.getenv("API_KEY",   "")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 
 # Qdrant Configuration
 QDRANT_CLUSTER_URL = os.environ.get("QDRANT_CLUSTER_URL")

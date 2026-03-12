@@ -92,18 +92,22 @@ async def _handle_static(reader, writer):
 # ══════════════════════════════════════════════════════════════════
 
 async def main():
+    # Bind to 127.0.0.1 in production (nginx proxies externally).
+    # Change to 0.0.0.0 only for local dev without nginx.
+    _bind = os.environ.get("BIND_HOST", "0.0.0.0")
+
     flask_thread = threading.Thread(
-        target=lambda: flask_app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False),
+        target=lambda: flask_app.run(host=_bind, port=5001, debug=False, use_reloader=False),
         daemon=True,
         name="flask-api",
     )
     flask_thread.start()
-    logger.info("[flask] REST API on http://0.0.0.0:5001")
+    logger.info(f"[flask] REST API on http://{_bind}:5001")
 
-    logger.info("[ws_gateway] WebSocket gateway on ws://0.0.0.0:8080/ws")
-    logger.info("[ws_gateway] Static file server on http://0.0.0.0:8081")
-    static_server = await asyncio.start_server(_handle_static, "0.0.0.0", 8081)
-    async with websockets.serve(ws_handler, "0.0.0.0", 8080):
+    logger.info(f"[ws_gateway] WebSocket gateway on ws://{_bind}:8080/ws")
+    logger.info(f"[ws_gateway] Static file server on http://{_bind}:8081")
+    static_server = await asyncio.start_server(_handle_static, _bind, 8081)
+    async with websockets.serve(ws_handler, _bind, 8080):
         async with static_server:
             await asyncio.Future()
 

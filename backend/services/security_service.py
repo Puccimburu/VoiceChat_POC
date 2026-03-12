@@ -6,7 +6,6 @@ Security service — handles:
 import os
 import base64
 import hashlib
-from pymongo import MongoClient
 
 # ── Fernet encryption for DB connection strings ──────────────────
 try:
@@ -14,8 +13,6 @@ try:
     _ENCRYPT_AVAILABLE = True
 except ImportError:
     _ENCRYPT_AVAILABLE = False
-
-from config import PLATFORM_MONGO_URI, PLATFORM_DB
 
 # Encryption key — store in env in production, never hardcode
 # Generate once with: from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())
@@ -55,44 +52,19 @@ def decrypt_connection_string(encrypted_uri: str) -> str:
 
 # ── Domain allowlist ─────────────────────────────────────────────
 
-def check_origin_allowed(api_key: str, origin: str) -> bool:
+def check_origin_allowed(origin: str) -> bool:
     """
-    Return True if the request origin is allowed for this API key.
-
-    If no allowed_domains are set on the key, any origin is allowed
-    (useful for development / testing).
+    Return True if the request origin is in the ALLOWED_ORIGINS env var.
+    Empty ALLOWED_ORIGINS = allow all (dev mode).
     """
-    if not origin:
-        return True   # no Origin header (e.g. server-to-server) — allow
+    from config import ALLOWED_ORIGINS
+    if not ALLOWED_ORIGINS or not origin:
+        return True
 
-    try:
-        db = MongoClient(PLATFORM_MONGO_URI)[PLATFORM_DB]
-        doc = db.api_keys.find_one({"key": api_key}, {"allowed_domains": 1})
-        if not doc:
-            return False
+    def normalise(url):
+        return url.lower().replace("https://", "").replace("http://", "").rstrip("/")
 
-        allowed = doc.get("allowed_domains", [])
-        if not allowed:
-            return True   # no restriction configured
-
-        # Normalize: strip protocol and trailing slash
-        def normalise(url):
-            return url.lower().replace("https://", "").replace("http://", "").rstrip("/")
-
-        origin_clean = normalise(origin)
-        return any(normalise(d) in origin_clean for d in allowed)
-
-    except Exception as e:
-        print(f"Domain check error: {e}")
-        return True   # fail open during dev — flip to False in production
-
-
-def set_allowed_domains(api_key: str, domains: list[str]):
-    """Update the domain allowlist for a given API key."""
-    db = MongoClient(PLATFORM_MONGO_URI)[PLATFORM_DB]
-    db.api_keys.update_one(
-        {"key": api_key},
-        {"$set": {"allowed_domains": domains}}
-    )
+    o = normalise(origin)
+    return any(o == normalise(d) or o.endswith("." + normalise(d)) for d in ALLOWED_ORIGINS)
 
 

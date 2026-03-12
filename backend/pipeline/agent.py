@@ -70,81 +70,29 @@ from .base import _executor, _SENTINEL
 from .helpers import is_short_greeting, pick_filler, extract_sentences, pick_greeting_reply
 from .tts import dispatch_tts, run_ordering_worker
 from services.session_service import get_or_create_session, add_to_conversation_history, save_session
-from services.security_service import decrypt_connection_string
 from services.mongodb_agent_service import MongoDBAgent
 from services.sqlite_agent_service import SQLiteAgent
-from config import PLATFORM_MONGO_URI, PLATFORM_DB
+from config import DB_TYPE, MONGO_URI, MONGO_DB
 
 logger = logging.getLogger("ws_gateway")
 
-# One MongoClient per unique connection string — shared across all sessions/tenants
-# that use the same database, avoiding a new TLS handshake on every voice turn.
-_client_cache: dict = {}
-
-def _get_mongo_client(conn_str: str) -> MongoClient:
-    if conn_str not in _client_cache:
-        _client_cache[conn_str] = MongoClient(conn_str)
-    return _client_cache[conn_str]
-
-# Cache db_config per api_key — avoids a find_one round-trip to Atlas on every voice turn.
-_db_config_cache: dict = {}
-_DB_CONFIG_TTL = 3600  # seconds (1 hour — api_keys rarely change)
-
-def _get_db_config(api_key: str) -> Optional[dict]:
-    now = time.monotonic()
-    cached = _db_config_cache.get(api_key)
-    if cached and (now - cached["ts"]) < _DB_CONFIG_TTL:
-        return cached["cfg"]
-    try:
-        platform_client = _get_mongo_client(PLATFORM_MONGO_URI)
-        doc = platform_client[PLATFORM_DB].api_keys.find_one({"key": api_key}, {"db_config": 1})
-        cfg = None
-        if doc and doc.get("db_config"):
-            cfg = dict(doc["db_config"])
-            if "connection_string" in cfg:
-                cfg["connection_string"] = decrypt_connection_string(cfg["connection_string"])
-        _db_config_cache[api_key] = {"cfg": cfg, "ts": now}
-        return cfg
-    except Exception as e:
-        logger.error(f"DB config lookup error: {e}")
-        return None
+# Single shared MongoClient — one connection pool for the whole process
+_mongo_client     = MongoClient(MONGO_URI, maxPoolSize=80, minPoolSize=5)
+_single_db_config = {"type": DB_TYPE, "connection_string": MONGO_URI, "database": MONGO_DB}
 
 
 def prewarm_connections():
-    """Pre-warm MongoDB connections at startup so the first voice turn has no cold-start latency."""
+    """Pre-warm MongoDB connection at startup to avoid cold-start latency on first voice turn."""
     try:
         t = time.monotonic()
-        platform_client = _get_mongo_client(PLATFORM_MONGO_URI)
-        platform_client.admin.command("ping")
-        logger.info(f"[prewarm] platform Atlas ping OK ({(time.monotonic()-t)*1000:.0f}ms)")
-
-        now = time.monotonic()
-        docs = list(platform_client[PLATFORM_DB].api_keys.find(
-            {"active": True}, {"key": 1, "db_config": 1}
-        ))
-        for doc in docs:
-            key = doc.get("key")
-            cfg = doc.get("db_config")
-            if not key or not cfg:
-                continue
-            try:
-                cfg = dict(cfg)
-                if "connection_string" in cfg:
-                    cfg["connection_string"] = decrypt_connection_string(cfg["connection_string"])
-                _db_config_cache[key] = {"cfg": cfg, "ts": now}
-                conn_str = cfg.get("connection_string", PLATFORM_MONGO_URI)
-                if cfg.get("type", "mongodb") == "mongodb":
-                    client = _get_mongo_client(conn_str)
-                    client.admin.command("ping")
-                    logger.info(f"[prewarm] customer DB ping OK for key={key[:8]}...")
-            except Exception as e:
-                logger.warning(f"[prewarm] customer DB ping failed for key={key[:8]}...: {e}")
+        _mongo_client.admin.command("ping")
+        logger.info(f"[prewarm] DB ping OK ({(time.monotonic()-t)*1000:.0f}ms)")
     except Exception as e:
-        logger.warning(f"[prewarm] platform ping failed: {e}")
+        logger.warning(f"[prewarm] DB ping failed: {e}")
 
 
 async def run_agent_pipeline(
-    transcript: str, session_id: str, api_key: str, voice: str,
+    transcript: str, session_id: str, voice: str,
     send_audio_chunk, send_conv_pair, send_complete, send_error,
     stop_event: asyncio.Event,
     selected_member: dict = None,
@@ -189,19 +137,11 @@ async def run_agent_pipeline(
         _, session_data = get_or_create_session(session_id)
         history  = session_data.get("history", [])[-4:]
         pending  = session_data.get("variables", {}).get("pending_booking")
-        t_db = time.monotonic()
-        db_config = _get_db_config(api_key) if api_key else None
-        logger.info(f"[TIMING] db_config: {(time.monotonic()-t_db)*1000:.0f}ms")
-        db_type   = (db_config or {}).get("type", "mongodb")
-        if db_type == "sqlite":
-            agent = SQLiteAgent(db_config=db_config)
+        if DB_TYPE == "sqlite":
+            agent = SQLiteAgent(db_config=_single_db_config)
         else:
-            # Reuse a cached MongoClient for this connection string so the Atlas
-            # TLS handshake only happens once per unique tenant database endpoint.
-            # Each request gets a fresh MongoDBAgent (fresh per-query state) that
-            # wraps the shared client — safe for concurrent multi-tenant sessions.
-            conn_str = (db_config or {}).get("connection_string", PLATFORM_MONGO_URI)
-            agent = MongoDBAgent(db_config=db_config, mongo_client=_get_mongo_client(conn_str))
+            # Fresh agent per request (has per-query state), shared MongoClient
+            agent = MongoDBAgent(db_config=_single_db_config, mongo_client=_mongo_client)
         # Normalize STT garbling before the agent sees the transcript
         normalized = _normalize_transcript(transcript)
         # Prepend selected member context so the agent knows who is speaking
